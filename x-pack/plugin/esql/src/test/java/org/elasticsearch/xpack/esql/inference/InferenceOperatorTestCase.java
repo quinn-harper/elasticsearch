@@ -202,7 +202,9 @@ public abstract class InferenceOperatorTestCase<InferenceResultsType extends Inf
         return context -> new EvalOperator.ExpressionEvaluator() {
             @Override
             public Block eval(Page page) {
-                return BlockUtils.deepCopyOf(page.getBlock(channel), blockFactory());
+                Block b = page.getBlock(channel);
+                b.incRef();
+                return b;
             }
 
             @Override
