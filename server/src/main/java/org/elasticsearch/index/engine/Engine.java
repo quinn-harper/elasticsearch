@@ -11,6 +11,7 @@ package org.elasticsearch.index.engine;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfo;
@@ -74,6 +75,8 @@ import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.VersionType;
 import org.elasticsearch.index.codec.FieldInfosWithUsages;
 import org.elasticsearch.index.codec.TrackingPostingsInMemoryBytesCodec;
+import org.elasticsearch.index.codec.vectors.diskbbq.CalibrationAwareReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
 import org.elasticsearch.index.mapper.DocumentParser;
 import org.elasticsearch.index.mapper.LuceneDocument;
 import org.elasticsearch.index.mapper.Mapper;
@@ -1450,10 +1453,12 @@ public abstract class Engine implements Closeable {
         segment.attributes = new HashMap<>();
         segment.attributes.putAll(info.info.getAttributes());
         Map<String, List<String>> knnFormats = null;
+        Map<String, Segment.FieldCalibrationInfo> calibrationInfoMap = null;
         if (includeVectorFormatsInfo) {
             try {
                 FieldInfos fieldInfos = segmentReader.getFieldInfos();
                 if (fieldInfos.hasVectorValues()) {
+                    KnnVectorsReader topLevelReader = segmentReader.getVectorReader();
                     for (FieldInfo fieldInfo : fieldInfos) {
                         String name = fieldInfo.getName();
                         if (fieldInfo.hasVectorValues()) {
@@ -1468,6 +1473,27 @@ public abstract class Engine implements Closeable {
                                 a.add(name);
                                 return a;
                             });
+                            KnnVectorsReader fieldReader = topLevelReader;
+                            if (fieldReader instanceof PerFieldKnnVectorsFormat.FieldsReader perField) {
+                                fieldReader = perField.getFieldReader(fieldInfo.name);
+                            }
+                            if (fieldReader instanceof CalibrationAwareReader cal) {
+                                QuantEncoding encoding = cal.getQuantEncoding(fieldInfo);
+                                boolean calibrated = encoding != null;
+                                if (calibrationInfoMap == null) {
+                                    calibrationInfoMap = new HashMap<>();
+                                }
+                                calibrationInfoMap.put(
+                                    name,
+                                    new Segment.FieldCalibrationInfo(
+                                        calibrated,
+                                        calibrated ? encoding.bits() : (byte) -1,
+                                        calibrated ? encoding.queryBits() : (byte) -1,
+                                        cal.getOversampleFactor(fieldInfo),
+                                        cal.shouldPrecondition(fieldInfo)
+                                    )
+                                );
+                            }
                         }
                     }
                 }
@@ -1480,6 +1506,7 @@ public abstract class Engine implements Closeable {
                 segment.attributes.put(entry.getKey(), entry.getValue().toString());
             }
         }
+        segment.autoCalibrationInfo = calibrationInfoMap;
         // TODO: add more fine grained mem stats values to per segment info here
         segments.put(info.info.name, segment);
     }

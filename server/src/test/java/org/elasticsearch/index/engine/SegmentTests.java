@@ -16,12 +16,15 @@ import org.apache.lucene.search.SortedNumericSortField;
 import org.apache.lucene.search.SortedSetSelector;
 import org.apache.lucene.search.SortedSetSortField;
 import org.apache.lucene.util.Version;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.TransportVersionUtils;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Map;
 import java.util.Objects;
 
 public class SegmentTests extends ESTestCase {
@@ -73,6 +76,15 @@ public class SegmentTests extends ESTestCase {
         return new Sort(fields);
     }
 
+    static Segment.FieldCalibrationInfo randomFieldCalibrationInfo() {
+        boolean calibrated = randomBoolean();
+        byte bits = calibrated ? randomFrom((byte) 1, (byte) 2, (byte) 4, (byte) 7) : (byte) -1;
+        byte queryBits = calibrated ? (bits == 7 ? (byte) 7 : (byte) 4) : (byte) -1;
+        float oversample = calibrated ? randomFloatBetween(1.0f, 3.0f, true) : Float.NaN;
+        boolean precondition = randomBoolean();
+        return new Segment.FieldCalibrationInfo(calibrated, bits, queryBits, oversample, precondition);
+    }
+
     static Segment randomSegment() {
         Segment segment = new Segment(randomAlphaOfLength(10));
         segment.committed = randomBoolean();
@@ -86,6 +98,9 @@ public class SegmentTests extends ESTestCase {
         segment.segmentSort = randomIndexSort();
         if (randomBoolean()) {
             segment.attributes = Collections.singletonMap("foo", "bar");
+        }
+        if (randomBoolean()) {
+            segment.autoCalibrationInfo = Map.of(randomAlphaOfLength(5), randomFieldCalibrationInfo());
         }
         return segment;
     }
@@ -102,7 +117,44 @@ public class SegmentTests extends ESTestCase {
         }
     }
 
+    public void testSerializationOldTransportVersion() throws IOException {
+        TransportVersion old = TransportVersionUtils.getPreviousVersion(TransportVersion.current());
+        for (int i = 0; i < 10; i++) {
+            Segment segment = randomSegment();
+            // populate autoCalibrationInfo so we can verify it is not sent to old nodes
+            segment.autoCalibrationInfo = Map.of("field", randomFieldCalibrationInfo());
+            BytesStreamOutput output = new BytesStreamOutput();
+            output.setTransportVersion(old);
+            segment.writeTo(output);
+            output.flush();
+            StreamInput input = output.bytes().streamInput();
+            input.setTransportVersion(old);
+            Segment deserialized = new Segment(input);
+            assertNull(deserialized.autoCalibrationInfo);
+        }
+    }
+
+    static boolean isFieldCalibrationInfoEquals(Segment.FieldCalibrationInfo a, Segment.FieldCalibrationInfo b) {
+        if (a == b) return true;
+        if (a == null || b == null) return false;
+        return a.calibrated == b.calibrated
+            && a.bits == b.bits
+            && a.queryBits == b.queryBits
+            && (Float.isNaN(a.oversample) ? Float.isNaN(b.oversample) : Float.compare(a.oversample, b.oversample) == 0)
+            && a.precondition == b.precondition;
+    }
+
     static boolean isSegmentEquals(Segment seg1, Segment seg2) {
+        if (seg1.autoCalibrationInfo == null && seg2.autoCalibrationInfo != null) return false;
+        if (seg1.autoCalibrationInfo != null && seg2.autoCalibrationInfo == null) return false;
+        if (seg1.autoCalibrationInfo != null) {
+            if (seg1.autoCalibrationInfo.size() != seg2.autoCalibrationInfo.size()) return false;
+            for (var entry : seg1.autoCalibrationInfo.entrySet()) {
+                if (isFieldCalibrationInfoEquals(entry.getValue(), seg2.autoCalibrationInfo.get(entry.getKey())) == false) {
+                    return false;
+                }
+            }
+        }
         return seg1.docCount == seg2.docCount
             && seg1.delDocCount == seg2.delDocCount
             && seg1.committed == seg2.committed

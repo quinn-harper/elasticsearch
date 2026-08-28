@@ -132,6 +132,24 @@ public class IndicesSegmentResponse extends ChunkedBroadcastResponse {
                                                 if (segment.attributes != null && segment.attributes.isEmpty() == false) {
                                                     builder.field("attributes", segment.attributes);
                                                 }
+                                                if (segment.autoCalibrationInfo != null && segment.autoCalibrationInfo.isEmpty() == false) {
+                                                    builder.startObject(Fields.AUTO_CALIBRATION);
+                                                    for (var entry : segment.autoCalibrationInfo.entrySet()) {
+                                                        var cal = entry.getValue();
+                                                        builder.startObject(entry.getKey());
+                                                        builder.field(Fields.CALIBRATED, cal.calibrated);
+                                                        if (cal.calibrated) {
+                                                            builder.startObject(Fields.ENCODING);
+                                                            builder.field(Fields.BITS, cal.bits);
+                                                            builder.field(Fields.QUERY_BITS, cal.queryBits);
+                                                            builder.endObject();
+                                                            builder.field(Fields.OVERSAMPLE, cal.oversample);
+                                                        }
+                                                        builder.field(Fields.PRECONDITION, cal.precondition);
+                                                        builder.endObject();
+                                                    }
+                                                    builder.endObject();
+                                                }
                                                 builder.endObject();
                                                 return builder;
                                             })
@@ -194,5 +212,13 @@ public class IndicesSegmentResponse extends ChunkedBroadcastResponse {
         static final String MERGE_ID = "merge_id";
         static final String MEMORY = "memory";
         static final String MEMORY_IN_BYTES = "memory_in_bytes";
+
+        static final String AUTO_CALIBRATION = "auto_calibration";
+        static final String CALIBRATED = "calibrated";
+        static final String ENCODING = "encoding";
+        static final String BITS = "bits";
+        static final String QUERY_BITS = "queryBits";
+        static final String OVERSAMPLE = "oversample";
+        static final String PRECONDITION = "precondition";
     }
 }

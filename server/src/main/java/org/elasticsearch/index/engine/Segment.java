@@ -15,6 +15,7 @@ import org.apache.lucene.search.SortedNumericSelector;
 import org.apache.lucene.search.SortedNumericSortField;
 import org.apache.lucene.search.SortedSetSelector;
 import org.apache.lucene.search.SortedSetSortField;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
@@ -28,6 +29,60 @@ import java.util.Objects;
 
 public class Segment implements Writeable {
 
+    private static final TransportVersion SEGMENT_AUTO_CALIBRATION_INFO = TransportVersion.fromName("segment_auto_calibration_info");
+
+    /**
+     * Per-field auto-calibration state stored in a segment. Only populated when the field's vector
+     * format implements {@link org.elasticsearch.index.codec.vectors.diskbbq.CalibrationAwareReader}
+     * and the request asked for vector format details.
+     */
+    public static final class FieldCalibrationInfo implements Writeable {
+        /** Whether calibration has run for this field in this segment. */
+        public final boolean calibrated;
+        /**
+         * Document-side quantization bit width selected by calibration.
+         * Meaningful only when {@code calibrated == true}.
+         */
+        public final byte bits;
+        /**
+         * Query-side quantization bit width selected by calibration.
+         * Meaningful only when {@code calibrated == true}.
+         */
+        public final byte queryBits;
+        /**
+         * Calibration-derived rerank oversample factor.
+         * {@link Float#NaN} when not calibrated.
+         */
+        public final float oversample;
+        /** Whether calibration determined preconditioning should be applied. */
+        public final boolean precondition;
+
+        public FieldCalibrationInfo(boolean calibrated, byte bits, byte queryBits, float oversample, boolean precondition) {
+            this.calibrated = calibrated;
+            this.bits = bits;
+            this.queryBits = queryBits;
+            this.oversample = oversample;
+            this.precondition = precondition;
+        }
+
+        public FieldCalibrationInfo(StreamInput in) throws IOException {
+            this.calibrated = in.readBoolean();
+            this.bits = in.readByte();
+            this.queryBits = in.readByte();
+            this.oversample = in.readFloat();
+            this.precondition = in.readBoolean();
+        }
+
+        @Override
+        public void writeTo(StreamOutput out) throws IOException {
+            out.writeBoolean(calibrated);
+            out.writeByte(bits);
+            out.writeByte(queryBits);
+            out.writeFloat(oversample);
+            out.writeBoolean(precondition);
+        }
+    }
+
     private String name;
     private long generation;
     public boolean committed;
@@ -40,6 +95,9 @@ public class Segment implements Writeable {
     public String mergeId;
     public Sort segmentSort;
     public Map<String, String> attributes;
+    /** Per-field auto-calibration info. Null when not requested or not available. */
+    @Nullable
+    public Map<String, FieldCalibrationInfo> autoCalibrationInfo;
 
     public Segment(StreamInput in) throws IOException {
         name = in.readString();
@@ -60,6 +118,13 @@ public class Segment implements Writeable {
             attributes = in.readMap(StreamInput::readString);
         } else {
             attributes = null;
+        }
+        if (in.getTransportVersion().supports(SEGMENT_AUTO_CALIBRATION_INFO)) {
+            if (in.readBoolean()) {
+                autoCalibrationInfo = in.readMap(FieldCalibrationInfo::new);
+            } else {
+                autoCalibrationInfo = null;
+            }
         }
     }
 
@@ -162,6 +227,12 @@ public class Segment implements Writeable {
         out.writeBoolean(hasAttributes);
         if (hasAttributes) {
             out.writeMap(attributes, StreamOutput::writeString);
+        }
+        if (out.getTransportVersion().supports(SEGMENT_AUTO_CALIBRATION_INFO)) {
+            out.writeBoolean(autoCalibrationInfo != null);
+            if (autoCalibrationInfo != null) {
+                out.writeMap(autoCalibrationInfo, StreamOutput::writeWriteable);
+            }
         }
     }
 
