@@ -21,7 +21,11 @@ import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.index.codec.vectors.diskbbq.CalibrationAwareReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
 import org.elasticsearch.index.shard.DenseVectorStats;
+import org.elasticsearch.index.shard.DenseVectorStats.AutoCalibrationEntry;
+import org.elasticsearch.index.shard.DenseVectorStats.AutoCalibrationKey;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -45,24 +49,35 @@ final class DenseVectorStatsCache {
         final Map<String, Long> cachedCounts = includeCounts ? cacheFor(leafReader) : null;
         long count = 0;
         final Map<String, Map<String, Long>> offHeapStats = new HashMap<>();
+        final Map<String, Map<AutoCalibrationKey, AutoCalibrationEntry>> autoCalibrationStats = new HashMap<>();
         for (String fieldName : fieldNames) {
             final FieldInfo info = leafReader.getFieldInfos().fieldInfo(fieldName);
             if (info == null || info.getVectorDimension() <= 0) {
                 continue;
             }
+            long fieldCount = 0;
             if (includeCounts) {
-                Long fieldCount = cachedCounts == null ? null : cachedCounts.get(fieldName);
-                if (fieldCount == null) {
-                    fieldCount = countVectors(leafReader, info);
+                Long cached = cachedCounts == null ? null : cachedCounts.get(fieldName);
+                if (cached == null) {
+                    cached = countVectors(leafReader, info);
                     if (cachedCounts != null) {
-                        cachedCounts.put(fieldName, fieldCount);
+                        cachedCounts.put(fieldName, cached);
                     }
                 }
+                fieldCount = cached;
                 count += fieldCount;
             }
-            offHeapStats.put(fieldName, offHeapByteSize(leafReader, info));
+            final KnnVectorsReader fieldReader = fieldReader(leafReader, info);
+            final Map<String, Long> fieldOffHeap = fieldReader.getOffHeapByteSize(info);
+            offHeapStats.put(fieldName, fieldOffHeap);
+            final long fieldSizeInBytes = fieldOffHeap.values().stream().mapToLong(Long::longValue).sum();
+            final AutoCalibrationKey key = calibrationKey(fieldReader, info);
+            autoCalibrationStats.put(
+                fieldName,
+                Map.of(key, new AutoCalibrationEntry(key, 1, fieldCount, fieldSizeInBytes))
+            );
         }
-        return new DenseVectorStats(count, Collections.unmodifiableMap(offHeapStats));
+        return new DenseVectorStats(count, Collections.unmodifiableMap(offHeapStats), Collections.unmodifiableMap(autoCalibrationStats));
     }
 
     /**
@@ -107,13 +122,30 @@ final class DenseVectorStatsCache {
         };
     }
 
-    private static Map<String, Long> offHeapByteSize(LeafReader leafReader, FieldInfo info) throws IOException {
+    private static KnnVectorsReader fieldReader(LeafReader leafReader, FieldInfo info) throws IOException {
         final SegmentReader segmentReader = Lucene.segmentReader(leafReader);
         KnnVectorsReader vectorsReader = segmentReader.getVectorReader();
         if (vectorsReader instanceof PerFieldKnnVectorsFormat.FieldsReader fieldsReader) {
             vectorsReader = fieldsReader.getFieldReader(info.name);
         }
-        return vectorsReader.getOffHeapByteSize(info);
+        return vectorsReader;
+    }
+
+    private static AutoCalibrationKey calibrationKey(KnnVectorsReader fieldReader, FieldInfo info) {
+        if (fieldReader instanceof CalibrationAwareReader calibrationAwareReader) {
+            final QuantEncoding encoding = calibrationAwareReader.getQuantEncoding(info);
+            final float oversample = calibrationAwareReader.getOversampleFactor(info);
+            if (encoding != null && Float.isNaN(oversample) == false) {
+                return new AutoCalibrationKey(
+                    true,
+                    encoding.bits(),
+                    encoding.queryBits(),
+                    oversample,
+                    calibrationAwareReader.shouldPrecondition(info)
+                );
+            }
+        }
+        return AutoCalibrationKey.UNCALIBRATED;
     }
 
     // visible for testing
