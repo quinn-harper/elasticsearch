@@ -1763,6 +1763,8 @@ PUT /thai_example
 
 1. The default stopwords can be overridden with the `stopwords` or `stopwords_path` parameters.
 
+Indices created before the Lucene 10.6 upgrade keep the previous `thai` behavior: the analyzer has no `thai` character filter, `thai_normalization` or `thai_repeat`, the `_thai_` stopword list is the previous one, and the `thai` tokenizer only treats line and paragraph separators as safe places to cut its internal buffer. To get the new behavior for an existing index, reindex it into a new index.
+
 
 
 

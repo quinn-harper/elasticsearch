@@ -47,6 +47,25 @@ public class PreBuiltAnalyzerProviderFactory extends PreConfiguredAnalysisCompon
         this.current = new PreBuiltAnalyzerProvider(name, AnalyzerScope.INDICES, analyzer);
     }
 
+    private PreBuiltAnalyzerProviderFactory(Function<IndexVersion, Analyzer> create, String name, PreBuiltCacheFactory.CachingStrategy cache) {
+        super(name, cache);
+        this.create = create;
+        this.current = new PreBuiltAnalyzerProvider(name, AnalyzerScope.INDICES, create.apply(IndexVersion.current()));
+    }
+
+    /**
+     * Creates a factory for an analyzer whose behavior depends on the version the index was created with. With
+     * {@link PreBuiltCacheFactory.CachingStrategy#LUCENE} the analyzer for a version is cached per Lucene version, so {@code create} may only
+     * vary its result on boundaries that coincide with a Lucene version change.
+     */
+    public static PreBuiltAnalyzerProviderFactory indexVersion(
+        String name,
+        PreBuiltCacheFactory.CachingStrategy cache,
+        Function<IndexVersion, Analyzer> create
+    ) {
+        return new PreBuiltAnalyzerProviderFactory(create, name, cache);
+    }
+
     @Override
     public AnalyzerProvider<?> get(IndexSettings indexSettings, Environment environment, String name, Settings settings)
         throws IOException {

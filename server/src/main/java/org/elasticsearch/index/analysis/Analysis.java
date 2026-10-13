@@ -53,6 +53,8 @@ import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.env.Environment;
+import org.elasticsearch.index.IndexVersion;
+import org.elasticsearch.index.IndexVersions;
 import org.elasticsearch.synonyms.PagedResult;
 import org.elasticsearch.synonyms.SynonymRule;
 import org.elasticsearch.synonyms.SynonymsManagementAPIService;
@@ -69,6 +71,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -129,9 +132,25 @@ public class Analysis {
         entry("_sorani_", SoraniAnalyzer.getDefaultStopSet()),
         entry("_spanish_", SpanishAnalyzer.getDefaultStopSet()),
         entry("_swedish_", SwedishAnalyzer.getDefaultStopSet()),
-        entry("_thai_", ThaiAnalyzer.getDefaultStopSet()),
+        entry("_thai_", LegacyThaiStopWords.getStopSet()),
         entry("_turkish_", TurkishAnalyzer.getDefaultStopSet())
     );
+
+    /**
+     * Same as {@link #NAMED_STOP_WORDS} except that {@code _thai_} is the Lucene 10.6 curated list, which is used for
+     * indices created on or after {@link IndexVersions#UPGRADE_TO_LUCENE_10_6_0}.
+     */
+    private static final Map<String, Set<?>> NAMED_STOP_WORDS_LUCENE_10_6;
+
+    static {
+        Map<String, Set<?>> namedStopWords = new HashMap<>(NAMED_STOP_WORDS);
+        namedStopWords.put("_thai_", ThaiAnalyzer.getDefaultStopSet());
+        NAMED_STOP_WORDS_LUCENE_10_6 = Collections.unmodifiableMap(namedStopWords);
+    }
+
+    private static Map<String, Set<?>> namedStopWords(IndexVersion indexVersionCreated) {
+        return indexVersionCreated.onOrAfter(IndexVersions.UPGRADE_TO_LUCENE_10_6_0) ? NAMED_STOP_WORDS_LUCENE_10_6 : NAMED_STOP_WORDS;
+    }
 
     public static CharArraySet parseWords(
         Environment env,
@@ -160,6 +179,20 @@ public class Analysis {
         return parseWords(env, settings, "common_words", defaultCommonWords, NAMED_STOP_WORDS, ignoreCase);
     }
 
+    /**
+     * Same as {@link #parseCommonWords(Environment, Settings, CharArraySet, boolean)} but resolves named word lists that changed between
+     * Lucene versions, such as {@code _thai_}, according to the version the index was created with.
+     */
+    public static CharArraySet parseCommonWords(
+        IndexVersion indexVersionCreated,
+        Environment env,
+        Settings settings,
+        CharArraySet defaultCommonWords,
+        boolean ignoreCase
+    ) {
+        return parseWords(env, settings, "common_words", defaultCommonWords, namedStopWords(indexVersionCreated), ignoreCase);
+    }
+
     public static CharArraySet parseArticles(Environment env, Settings settings) {
         boolean articlesCase = settings.getAsBoolean("articles_case", false);
         return parseWords(env, settings, "articles", null, null, articlesCase);
@@ -172,6 +205,30 @@ public class Analysis {
 
     public static CharArraySet parseStopWords(Environment env, Settings settings, CharArraySet defaultStopWords, boolean ignoreCase) {
         return parseWords(env, settings, "stopwords", defaultStopWords, NAMED_STOP_WORDS, ignoreCase);
+    }
+
+    /**
+     * Same as {@link #parseStopWords(Environment, Settings, CharArraySet)} but resolves named word lists that changed between Lucene
+     * versions, such as {@code _thai_}, according to the version the index was created with.
+     */
+    public static CharArraySet parseStopWords(
+        IndexVersion indexVersionCreated,
+        Environment env,
+        Settings settings,
+        CharArraySet defaultStopWords
+    ) {
+        boolean stopwordsCase = settings.getAsBoolean("stopwords_case", false);
+        return parseStopWords(indexVersionCreated, env, settings, defaultStopWords, stopwordsCase);
+    }
+
+    public static CharArraySet parseStopWords(
+        IndexVersion indexVersionCreated,
+        Environment env,
+        Settings settings,
+        CharArraySet defaultStopWords,
+        boolean ignoreCase
+    ) {
+        return parseWords(env, settings, "stopwords", defaultStopWords, namedStopWords(indexVersionCreated), ignoreCase);
     }
 
     /**
