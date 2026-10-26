@@ -569,6 +569,7 @@ public class KnnSearcher {
         finalResults.postFilter = searchParameters.postFilter();
         finalResults.exact = searchParameters.exact();
         finalResults.exactQuantized = searchParameters.exactQuantized();
+        finalResults.quantizedRescore = searchParameters.quantizedRescore();
         if (finalResults.totalIndexVectors > 0) {
             finalResults.actualVisitPercentage = (finalResults.averageVisited / finalResults.totalIndexVectors) * 100.0;
         }
@@ -888,7 +889,7 @@ public class KnnSearcher {
                 quantBits,
                 mappingOversample,
                 null // we don't differentiate between mapping and query oversample here
-            );
+            ).withQuantizedRescore(searchParameters.quantizedRescore());
             if (sliced) {
                 knnQuery = new IVFKnnFloatSlicedVectorQuery(
                     VECTOR_FIELD,
@@ -931,7 +932,14 @@ public class KnnSearcher {
             knnQuery = new PostFilterKnnQuery(pfKnnQuery, filterQuery, resultK, VECTOR_FIELD, null, BENCHMARK_POST_FILTERING_THRESHOLD);
         }
         if (searchParameters.overSamplingFactor() > 1f && testConfiguration.autoCalibrate() == false) {
-            knnQuery = RescoreKnnVectorQuery.fromInnerQuery(VECTOR_FIELD, vector, resultK, overSampledTopK, knnQuery);
+            knnQuery = RescoreKnnVectorQuery.fromInnerQuery(
+                VECTOR_FIELD,
+                vector,
+                resultK,
+                overSampledTopK,
+                knnQuery,
+                searchParameters.quantizedRescore()
+            );
         }
         QueryProfiler profiler = new QueryProfiler();
         TopDocs docs = searcher.search(knnQuery, searchParameters.topK());

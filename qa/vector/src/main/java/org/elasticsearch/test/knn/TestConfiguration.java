@@ -91,7 +91,8 @@ public record TestConfiguration(
     long deleteSeed,
     float projectedDimsFraction,
     int maxProjectedDims,
-    String quantizationType
+    String quantizationType,
+    int rescoreBits
 ) {
 
     /** Whether this configuration uses the sliced IVF on-disk layout and query path. */
@@ -149,6 +150,8 @@ public record TestConfiguration(
     private static final ParseField PROJECTED_DIMS_FRACTION_FIELD = new ParseField("projected_dims_fraction");
     private static final ParseField MAX_PROJECTED_DIMS_FIELD = new ParseField("max_projected_dims");
     private static final ParseField QUANTIZATION_TYPE_FIELD = new ParseField("quantization_type");
+    static final ParseField RESCORE_BITS_FIELD = new ParseField("rescore_bits");
+    static final ParseField QUANTIZED_RESCORE_FIELD = new ParseField("quantized_rescore");
 
     /** By default, in ES the default writer buffer size is 10% of the heap space
      * (see {@code IndexingMemoryController.INDEX_BUFFER_SIZE_SETTING}).
@@ -235,6 +238,13 @@ public record TestConfiguration(
         PARSER.declareFloat(Builder::setProjectedDimsFraction, PROJECTED_DIMS_FRACTION_FIELD);
         PARSER.declareInt(Builder::setMaxProjectedDims, MAX_PROJECTED_DIMS_FIELD);
         PARSER.declareString(Builder::setQuantizationType, QUANTIZATION_TYPE_FIELD);
+        PARSER.declareInt(Builder::setRescoreBits, RESCORE_BITS_FIELD);
+        PARSER.declareFieldArray(
+            Builder::setQuantizedRescore,
+            (p, c) -> p.booleanValue(),
+            QUANTIZED_RESCORE_FIELD,
+            ObjectParser.ValueType.VALUE_ARRAY
+        );
     }
 
     public boolean autoCalibrate() {
@@ -334,6 +344,17 @@ public record TestConfiguration(
                 "exact_quantized",
                 "array[boolean]",
                 "Search: when exact is true, score against the codec's quantized representation " + "instead of raw full-precision vectors."
+            ),
+            new ParameterHelp(
+                "rescore_bits",
+                "int",
+                "IVF (osq, float or bfloat16 vectors): store residual codes of this many bits per dimension (1-8) so rescoring can skip "
+                    + "the raw vectors; 0 stores none."
+            ),
+            new ParameterHelp(
+                "quantized_rescore",
+                "array[boolean]",
+                "Search: when the index has rescore_bits, rescore with the stored residual codes (true) or with the raw vectors (false)."
             ),
             new ParameterHelp(
                 "search_params",
@@ -503,6 +524,8 @@ public record TestConfiguration(
         private float projectedDimsFraction = 0.5f;
         private int maxProjectedDims = 1024;
         private String quantizationType = "osq";
+        private int rescoreBits = 0;
+        private List<Boolean> quantizedRescore = List.of(Boolean.TRUE);
 
         /**
          * Elasticsearch does not set this explicitly, and in Lucene this setting is
@@ -763,6 +786,16 @@ public record TestConfiguration(
             return this;
         }
 
+        public Builder setRescoreBits(int rescoreBits) {
+            this.rescoreBits = rescoreBits;
+            return this;
+        }
+
+        public Builder setQuantizedRescore(List<Boolean> quantizedRescore) {
+            this.quantizedRescore = quantizedRescore;
+            return this;
+        }
+
         public void setProjectedDimsFraction(float projectedDimsFraction) {
             this.projectedDimsFraction = projectedDimsFraction;
         }
@@ -990,6 +1023,17 @@ public record TestConfiguration(
             if (exactQuantized.contains(Boolean.TRUE) && quantizeBits == null && indexType != KnnIndexTester.IndexType.IVF) {
                 throw new IllegalArgumentException("exact_quantized requires a quantized index; set quantize_bits or use index_type: ivf");
             }
+            if (rescoreBits != 0) {
+                if (rescoreBits < 1 || rescoreBits > 8) {
+                    throw new IllegalArgumentException("rescore_bits must be 0 or between 1 and 8, but got: " + rescoreBits);
+                }
+                if (indexType != KnnIndexTester.IndexType.IVF || "ash".equalsIgnoreCase(quantizationType)) {
+                    throw new IllegalArgumentException("rescore_bits requires index_type: ivf with quantization_type: osq");
+                }
+                if (vectorEncoding == KnnIndexTester.VectorEncoding.BYTE) {
+                    throw new IllegalArgumentException("rescore_bits is not supported for byte vectors");
+                }
+            }
             if (numDeletedDocs < 0) {
                 throw new IllegalArgumentException("num_deleted_docs must be >= 0, but got: " + numDeletedDocs);
             }
@@ -1030,7 +1074,8 @@ public record TestConfiguration(
                     postFilter.getFirst(),
                     seed.getFirst(),
                     exact.getFirst(),
-                    exactQuantized.getFirst()
+                    exactQuantized.getFirst(),
+                    quantizedRescore.getFirst()
                 );
 
                 for (var so : searchParams) {
@@ -1076,7 +1121,8 @@ public record TestConfiguration(
                 deleteSeed,
                 projectedDimsFraction,
                 maxProjectedDims,
-                quantizationType
+                quantizationType,
+                rescoreBits
             );
         }
 
@@ -1149,6 +1195,10 @@ public record TestConfiguration(
             }
             builder.field(EXACT_FIELD.getPreferredName(), exact);
             builder.field(EXACT_QUANTIZED_FIELD.getPreferredName(), exactQuantized);
+            if (rescoreBits > 0) {
+                builder.field(RESCORE_BITS_FIELD.getPreferredName(), rescoreBits);
+            }
+            builder.field(QUANTIZED_RESCORE_FIELD.getPreferredName(), quantizedRescore);
             return builder.endObject();
         }
 
@@ -1166,7 +1216,8 @@ public record TestConfiguration(
                 postFilter.size(),
                 seed.size(),
                 exact.size(),
-                exactQuantized.size()
+                exactQuantized.size(),
+                quantizedRescore.size()
             );
             return lengths.stream().max(Integer::compareTo).get();
         }
@@ -1186,7 +1237,8 @@ public record TestConfiguration(
                     postFilter,
                     seed,
                     exact,
-                    exactQuantized
+                    exactQuantized,
+                    quantizedRescore
                 )
             ).stream()
                 .map(
@@ -1203,7 +1255,8 @@ public record TestConfiguration(
                         (Boolean) params.get(9),
                         (Long) params.get(10),
                         (Boolean) params.get(11),
-                        (Boolean) params.get(12)
+                        (Boolean) params.get(12),
+                        (Boolean) params.get(13)
                     )
                 )
                 .filter(sp -> sp.exact() || sp.exactQuantized() == false)

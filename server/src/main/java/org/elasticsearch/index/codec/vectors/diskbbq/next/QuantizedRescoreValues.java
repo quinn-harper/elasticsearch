@@ -16,6 +16,8 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.Bits;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 
 import java.io.IOException;
 
@@ -24,6 +26,11 @@ import java.io.IOException;
  * Ordinals and doc ids are those of the raw vectors, so these values can replace them in the rescoring phase.
  * The estimated vector for ordinal {@code o} is {@code globalCentroid + lower + step * osqCode + scale * codebook[residualCode]},
  * which is the first level OSQ reconstruction plus the decoded residual.
+ * <p>
+ * The estimate is in the space the segment clusters and quantizes in, which is the rotated space when the segment is
+ * preconditioned. Scorers therefore rotate their target with the segment's preconditioner first. The rotation preserves
+ * dot products and Euclidean distances, so the score still approximates the similarity to the original vector.
+ * {@link #vectorValue} returns the estimate in that clustering space and is not the original vector for such segments.
  */
 final class QuantizedRescoreValues extends FloatVectorValues {
 
@@ -31,6 +38,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
     private final IndexInput sectionInput;
     private final VectorSimilarityFunction similarityFunction;
     private final float[] globalCentroid;
+    private final Preconditioner preconditioner;
     private final int rescoreBits;
     private final int osqBits;
     private final int dimension;
@@ -51,12 +59,14 @@ final class QuantizedRescoreValues extends FloatVectorValues {
      *
      * @param rawValues the raw vectors of the same field and segment, used for ordinals and doc ids
      * @param sectionInput an input over exactly the section, positioned anywhere
+     * @param preconditioner the segment's preconditioner when its vectors were rotated before quantization, otherwise {@code null}
      */
     static QuantizedRescoreValues open(
         FloatVectorValues rawValues,
         IndexInput sectionInput,
         VectorSimilarityFunction similarityFunction,
-        float[] globalCentroid
+        float[] globalCentroid,
+        @Nullable Preconditioner preconditioner
     ) throws IOException {
         final IndexInput header = sectionInput.clone();
         header.seek(0);
@@ -83,6 +93,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
             sectionInput,
             similarityFunction,
             globalCentroid,
+            preconditioner,
             rescoreBits,
             osqBits,
             dimension,
@@ -98,6 +109,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         IndexInput sectionInput,
         VectorSimilarityFunction similarityFunction,
         float[] globalCentroid,
+        @Nullable Preconditioner preconditioner,
         int rescoreBits,
         int osqBits,
         int dimension,
@@ -110,6 +122,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         this.sectionInput = sectionInput;
         this.similarityFunction = similarityFunction;
         this.globalCentroid = globalCentroid;
+        this.preconditioner = preconditioner;
         this.rescoreBits = rescoreBits;
         this.osqBits = osqBits;
         this.dimension = dimension;
@@ -158,6 +171,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
             sectionInput.clone(),
             similarityFunction,
             globalCentroid,
+            preconditioner,
             rescoreBits,
             osqBits,
             dimension,
@@ -214,7 +228,12 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         private final KnnVectorValues.DocIndexIterator scorerIterator = rawValues.iterator();
 
         ResidualScorer(float[] target) {
-            this.target = target;
+            if (preconditioner == null) {
+                this.target = target;
+            } else {
+                this.target = new float[target.length];
+                preconditioner.applyTransform(target, this.target);
+            }
         }
 
         @Override
