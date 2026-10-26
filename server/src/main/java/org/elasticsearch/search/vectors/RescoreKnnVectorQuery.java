@@ -10,9 +10,12 @@
 package org.elasticsearch.search.vectors;
 
 import org.apache.lucene.codecs.lucene95.HasIndexSlice;
+import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.queries.function.FunctionScoreQuery;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.ConjunctionUtils;
@@ -30,7 +33,9 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
+import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.search.profile.query.QueryProfiler;
 
 import java.io.IOException;
@@ -115,13 +120,15 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     protected final VectorQueryTarget target;
     protected final int k;
     protected final Query innerQuery;
+    protected final boolean useQuantizedRescore;
     protected long vectorOperations = 0;
 
-    private RescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery) {
+    private RescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery, boolean useQuantizedRescore) {
         this.fieldName = fieldName;
         this.target = target;
         this.k = k;
         this.innerQuery = innerQuery;
+        this.useQuantizedRescore = useQuantizedRescore;
     }
 
     /**
@@ -134,7 +141,24 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
      * @param innerQuery               the original Lucene query to rescore
      */
     public static RescoreKnnVectorQuery fromInnerQuery(String fieldName, float[] floatTarget, int k, int rescoreK, Query innerQuery) {
-        return fromInnerQuery(fieldName, new VectorQueryTarget.FloatTarget(floatTarget), k, rescoreK, innerQuery);
+        return fromInnerQuery(fieldName, floatTarget, k, rescoreK, innerQuery, true);
+    }
+
+    /**
+     * Same as {@link #fromInnerQuery(String, float[], int, int, Query)}, with control over what vectors are rescored against.
+     *
+     * @param useQuantizedRescore when {@code true}, segments that store quantized residual codes for the field are rescored from
+     *                            those codes instead of the raw vectors. Segments without such codes always use the raw vectors.
+     */
+    public static RescoreKnnVectorQuery fromInnerQuery(
+        String fieldName,
+        float[] floatTarget,
+        int k,
+        int rescoreK,
+        Query innerQuery,
+        boolean useQuantizedRescore
+    ) {
+        return fromInnerQuery(fieldName, new VectorQueryTarget.FloatTarget(floatTarget), k, rescoreK, innerQuery, useQuantizedRescore);
     }
 
     /**
@@ -147,16 +171,23 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
      * @param innerQuery               the original Lucene query to rescore
      */
     public static RescoreKnnVectorQuery fromInnerQuery(String fieldName, byte[] byteTarget, int k, int rescoreK, Query innerQuery) {
-        return fromInnerQuery(fieldName, new VectorQueryTarget.ByteTarget(byteTarget), k, rescoreK, innerQuery);
+        return fromInnerQuery(fieldName, new VectorQueryTarget.ByteTarget(byteTarget), k, rescoreK, innerQuery, false);
     }
 
-    private static RescoreKnnVectorQuery fromInnerQuery(String fieldName, VectorQueryTarget target, int k, int rescoreK, Query innerQuery) {
+    private static RescoreKnnVectorQuery fromInnerQuery(
+        String fieldName,
+        VectorQueryTarget target,
+        int k,
+        int rescoreK,
+        Query innerQuery,
+        boolean useQuantizedRescore
+    ) {
         if ((innerQuery instanceof KnnFloatVectorQuery fQuery && fQuery.getK() == rescoreK)
             || (innerQuery instanceof KnnByteVectorQuery bQuery && bQuery.getK() == rescoreK)) {
             // Queries that return only the top `k` results and do not require reduction before re-scoring.
-            return new InlineRescoreQuery(fieldName, target, k, innerQuery);
+            return new InlineRescoreQuery(fieldName, target, k, innerQuery, useQuantizedRescore);
         }
-        return new LateRescoreQuery(fieldName, target, k, rescoreK, innerQuery);
+        return new LateRescoreQuery(fieldName, target, k, rescoreK, innerQuery, useQuantizedRescore);
     }
 
     public Query innerQuery() {
@@ -189,12 +220,13 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         return Objects.equals(fieldName, that.fieldName)
             && Objects.equals(target, that.target)
             && Objects.equals(k, that.k)
-            && Objects.equals(innerQuery, that.innerQuery);
+            && Objects.equals(innerQuery, that.innerQuery)
+            && useQuantizedRescore == that.useQuantizedRescore;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(fieldName, target, k, innerQuery);
+        return Objects.hash(fieldName, target, k, innerQuery, useQuantizedRescore);
     }
 
     @Override
@@ -214,13 +246,13 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     }
 
     private static class InlineRescoreQuery extends RescoreKnnVectorQuery {
-        private InlineRescoreQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery) {
-            super(fieldName, target, k, innerQuery);
+        private InlineRescoreQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery, boolean useQuantizedRescore) {
+            super(fieldName, target, k, innerQuery, useQuantizedRescore);
         }
 
         @Override
         public Query rewrite(IndexSearcher searcher) throws IOException {
-            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, innerQuery);
+            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, innerQuery, useQuantizedRescore);
             var topDocs = searcher.search(rescoreQuery, k);
             vectorOperations = topDocs.totalHits.value();
             return new KnnScoreDocQuery(topDocs.scoreDocs, searcher.getIndexReader());
@@ -242,8 +274,15 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     private static class LateRescoreQuery extends RescoreKnnVectorQuery {
         final int rescoreK;
 
-        private LateRescoreQuery(String fieldName, VectorQueryTarget target, int k, int rescoreK, Query innerQuery) {
-            super(fieldName, target, k, innerQuery);
+        private LateRescoreQuery(
+            String fieldName,
+            VectorQueryTarget target,
+            int k,
+            int rescoreK,
+            Query innerQuery,
+            boolean useQuantizedRescore
+        ) {
+            super(fieldName, target, k, innerQuery, useQuantizedRescore);
             this.rescoreK = rescoreK;
         }
 
@@ -256,7 +295,7 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
 
             // Retrieve top `k` documents from the top `rescoreK` query
             var topDocsQuery = new KnnScoreDocQuery(topDocs.scoreDocs, searcher.getIndexReader());
-            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, topDocsQuery);
+            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, topDocsQuery, useQuantizedRescore);
             var rescoreTopDocs = searcher.search(rescoreQuery.rewrite(searcher), k);
             return new KnnScoreDocQuery(rescoreTopDocs.scoreDocs, searcher.getIndexReader());
         }
@@ -282,11 +321,13 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         private final VectorQueryTarget target;
         private final String fieldName;
         private final Query innerQuery;
+        private final boolean useQuantizedRescore;
 
-        DirectRescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, Query innerQuery) {
+        DirectRescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, Query innerQuery, boolean useQuantizedRescore) {
             this.fieldName = fieldName;
             this.target = target;
             this.innerQuery = innerQuery;
+            this.useQuantizedRescore = useQuantizedRescore;
         }
 
         @Override
@@ -415,7 +456,7 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
                 if (target instanceof VectorQueryTarget.ByteTarget) {
                     knnVectorValues = leaf.reader().getByteVectorValues(fieldName);
                 } else {
-                    knnVectorValues = leaf.reader().getFloatVectorValues(fieldName);
+                    knnVectorValues = floatVectorValuesForRescoring(leaf.reader(), fieldName, useQuantizedRescore);
                 }
                 if (knnVectorValues == null) {
                     continue;
@@ -465,6 +506,26 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             }
 
             return new KnnScoreDocQuery(results.toArray(ScoreDoc[]::new), indexSearcher.getIndexReader());
+        }
+
+        /**
+         * Returns the vectors to rescore a leaf against: the segment's quantized rescore values when requested and stored for the
+         * field, otherwise the raw vectors.
+         */
+        private static FloatVectorValues floatVectorValuesForRescoring(LeafReader reader, String fieldName, boolean useQuantizedRescore)
+            throws IOException {
+            if (useQuantizedRescore) {
+                SegmentReader segmentReader = Lucene.tryUnwrapSegmentReader(reader);
+                if (segmentReader != null && segmentReader.getVectorReader() instanceof PerFieldKnnVectorsFormat.FieldsReader perField) {
+                    if (perField.getFieldReader(fieldName) instanceof QuantizedRescoringReader quantizedReader) {
+                        FloatVectorValues quantizedValues = quantizedReader.getQuantizedRescoreValues(fieldName);
+                        if (quantizedValues != null) {
+                            return quantizedValues;
+                        }
+                    }
+                }
+            }
+            return reader.getFloatVectorValues(fieldName);
         }
 
         private static IndexInput getIndexSliceOrNull(KnnVectorValues vectorValues) {
@@ -525,12 +586,12 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             if (this == obj) return true;
             if (obj == null || getClass() != obj.getClass()) return false;
             DirectRescoreKnnVectorQuery that = (DirectRescoreKnnVectorQuery) obj;
-            return Objects.equals(innerQuery, that.innerQuery);
+            return Objects.equals(innerQuery, that.innerQuery) && useQuantizedRescore == that.useQuantizedRescore;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(innerQuery, getClass());
+            return Objects.hash(innerQuery, useQuantizedRescore, getClass());
         }
     }
 }

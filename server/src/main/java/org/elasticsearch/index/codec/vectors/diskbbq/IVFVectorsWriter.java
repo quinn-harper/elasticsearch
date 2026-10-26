@@ -326,6 +326,19 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         return null;
     }
 
+    /**
+     * Called for each field that got centroids, after its centroid data and preconditioner are written to
+     * {@code centroidOutput} and immediately before its meta is written, on both flush and merge. A format can append extra
+     * per field data to {@code centroidOutput} here and record it in {@link #doWriteMeta}. Vectors are in ordinal order and
+     * are the un-preconditioned vectors only when no preconditioner is used. The default does nothing.
+     */
+    protected void writeExtraFieldData(
+        FieldInfo fieldInfo,
+        ClusteringVectorValues<?> vectors,
+        float[] globalCentroid,
+        IndexOutput centroidOutput
+    ) throws IOException {}
+
     @Override
     public final void flush(int maxDoc, Sorter.DocMap sortMap) throws IOException {
         rawVectorDelegate.flush(maxDoc, sortMap);
@@ -421,6 +434,8 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             long preconditionerOffset = ivfCentroids.getFilePointer();
             writePreconditioner(preconditioner, ivfCentroids);
             long preconditionerLength = ivfCentroids.getFilePointer() - preconditionerOffset;
+
+            writeExtraFieldData(fieldWriter.fieldInfo, clusteringVectorValues, globalCentroid, ivfCentroids);
 
             // write meta file
             writeMeta(
@@ -861,6 +876,8 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                     long preconditionerOffset = ivfCentroids.getFilePointer();
                     writePreconditioner(preconditioner, ivfCentroids);
                     long preconditionerLength = ivfCentroids.getFilePointer() - preconditionerOffset;
+
+                    writeExtraFieldData(fieldInfo, vectorValues, assignments.globalCentroid(), ivfCentroids);
 
                     assert assignments.centroidSlices() == null || assignments.centroidSlices().sliceOffsets().length > 0;
                     // write meta

@@ -31,6 +31,7 @@ public class IvfQueryConfigResolver {
     private final int quantBits;
     private final float mappingRescoreOversample;
     private final Float queryOversample;
+    private final boolean useQuantizedRescore;
 
     public IvfQueryConfigResolver(
         boolean autoCalibrate,
@@ -39,11 +40,43 @@ public class IvfQueryConfigResolver {
         float mappingRescoreOversample,
         @Nullable Float queryOversample
     ) {
+        this(autoCalibrate, mappingUsePrecondition, quantBits, mappingRescoreOversample, queryOversample, true);
+    }
+
+    private IvfQueryConfigResolver(
+        boolean autoCalibrate,
+        boolean mappingUsePrecondition,
+        int quantBits,
+        float mappingRescoreOversample,
+        @Nullable Float queryOversample,
+        boolean useQuantizedRescore
+    ) {
         this.autoCalibrate = autoCalibrate;
         this.mappingUsePrecondition = mappingUsePrecondition;
         this.quantBits = quantBits;
         this.mappingRescoreOversample = mappingRescoreOversample;
         this.queryOversample = queryOversample;
+        this.useQuantizedRescore = useQuantizedRescore;
+    }
+
+    /**
+     * Returns a copy that rescores with the stored quantized residual codes where a segment has them
+     * ({@code true}, the default) or always with the raw vectors ({@code false}). It travels with the resolver because the
+     * resolver already reaches every IVF query variant, including those that rescore internally.
+     */
+    public IvfQueryConfigResolver withQuantizedRescore(boolean useQuantizedRescore) {
+        return new IvfQueryConfigResolver(
+            autoCalibrate,
+            mappingUsePrecondition,
+            quantBits,
+            mappingRescoreOversample,
+            queryOversample,
+            useQuantizedRescore
+        );
+    }
+
+    public boolean useQuantizedRescore() {
+        return useQuantizedRescore;
     }
 
     public static IvfQueryConfigResolver from(
@@ -125,11 +158,12 @@ public class IvfQueryConfigResolver {
             && mappingUsePrecondition == that.mappingUsePrecondition
             && quantBits == that.quantBits
             && mappingRescoreOversample == that.mappingRescoreOversample
-            && Objects.equals(queryOversample, that.queryOversample);
+            && Objects.equals(queryOversample, that.queryOversample)
+            && useQuantizedRescore == that.useQuantizedRescore;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(autoCalibrate, mappingUsePrecondition, quantBits, mappingRescoreOversample, queryOversample);
+        return Objects.hash(autoCalibrate, mappingUsePrecondition, quantBits, mappingRescoreOversample, queryOversample, useQuantizedRescore);
     }
 }
