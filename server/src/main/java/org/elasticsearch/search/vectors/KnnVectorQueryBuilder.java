@@ -585,6 +585,7 @@ public class KnnVectorQueryBuilder extends LeafQueryBuilder<KnnVectorQueryBuilde
         boolean hnswEarlyTermination = context.getIndexSettings().getHnswEarlyTermination();
         float postFilterSelectivityThreshold = context.getIndexSettings().getPostFilterSelectivityThreshold();
         Float oversample = rescoreVectorBuilder() == null ? null : rescoreVectorBuilder.oversample();
+        Boolean quantizedRescore = rescoreVectorBuilder() == null ? null : rescoreVectorBuilder.quantized();
         // Filter caching now happens inside the mapper so that PostFilterKnnQuery receives the raw filter:
         // it evaluates the filter against a small candidate set and must avoid an eager full-index bitset build.
         return vectorFieldType.createKnnQuery(
@@ -593,6 +594,7 @@ public class KnnVectorQueryBuilder extends LeafQueryBuilder<KnnVectorQueryBuilde
             adjustedNumCands,
             visitPercentage,
             oversample,
+            quantizedRescore,
             filterQuery,
             vectorSimilarity,
             parentBitSet,

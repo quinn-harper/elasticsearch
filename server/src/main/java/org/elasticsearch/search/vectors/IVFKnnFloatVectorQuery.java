@@ -216,6 +216,13 @@ public class IVFKnnFloatVectorQuery extends AbstractIVFKnnVectorQuery {
 
     @Override
     Query getAutoRescoreQuery(IndexSearcher indexSearcher, Query approxTopN, int finalK, int rescoreK) {
-        return RescoreKnnVectorQuery.fromInnerQuery(field, query, finalK, rescoreK, approxTopN);
+        return RescoreKnnVectorQuery.fromInnerQuery(
+            field,
+            query,
+            finalK,
+            rescoreK,
+            approxTopN,
+            ivfQueryConfigResolver.useQuantizedRescore()
+        );
     }
 }

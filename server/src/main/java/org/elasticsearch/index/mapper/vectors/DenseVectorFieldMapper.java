@@ -2270,6 +2270,20 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 }
 
                 boolean doPrecondition = XContentMapValues.nodeBooleanValue(indexOptionsMap.remove("precondition"), false);
+                int rescoreBits = 0;
+                if (Build.current().isSnapshot()) {
+                    Object rescoreBitsNode = indexOptionsMap.remove("rescore_bits");
+                    if (rescoreBitsNode != null) {
+                        rescoreBits = BBQIVFIndexOptions.parseRescoreBits(
+                            fieldName,
+                            rescoreBitsNode,
+                            isAsh,
+                            doPrecondition,
+                            experimentalFeaturesEnabled,
+                            indexVersion
+                        );
+                    }
+                }
                 MappingParser.checkNoRemainingFields(fieldName, indexOptionsMap);
                 return new BBQIVFIndexOptions(
                     clusterSize,
@@ -2283,7 +2297,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     experimentalFeaturesEnabled,
                     autoCalibrate,
                     quantizationType,
-                    onDiskMerge
+                    onDiskMerge,
+                    rescoreBits
                 );
             }
 
@@ -3049,6 +3064,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
         final boolean experimentalFeaturesEnabled;
         final DenseVectorAutoCalibrate autoCalibrate;
         final QuantizationType quantizationType;
+        final int rescoreBits;
 
         public enum QuantizationType {
             OSQ("osq"),
@@ -3091,7 +3107,44 @@ public class DenseVectorFieldMapper extends FieldMapper {
             QuantizationType quantizationType,
             boolean onDiskMerge
         ) {
+            this(
+                clusterSize,
+                flatIndexThreshold,
+                defaultVisitPercentage,
+                onDiskRescore,
+                rescoreVector,
+                indexVersionCreated,
+                doPrecondition,
+                bits,
+                experimentalFeaturesEnabled,
+                autoCalibrate,
+                quantizationType,
+                onDiskMerge,
+                0
+            );
+        }
+
+        /**
+         * @param rescoreBits bits per dimension of the residual codes stored so that rescoring can skip the raw vectors,
+         *                    or {@code 0} to store none
+         */
+        public BBQIVFIndexOptions(
+            int clusterSize,
+            int flatIndexThreshold,
+            double defaultVisitPercentage,
+            boolean onDiskRescore,
+            RescoreVector rescoreVector,
+            IndexVersion indexVersionCreated,
+            boolean doPrecondition,
+            int bits,
+            boolean experimentalFeaturesEnabled,
+            @Nullable DenseVectorAutoCalibrate autoCalibrate,
+            QuantizationType quantizationType,
+            boolean onDiskMerge,
+            int rescoreBits
+        ) {
             super(VectorIndexType.BBQ_DISK, rescoreVector, onDiskMerge);
+            this.rescoreBits = rescoreBits;
             this.clusterSize = clusterSize;
             this.flatIndexThreshold = flatIndexThreshold;
             this.defaultVisitPercentage = defaultVisitPercentage;
@@ -3174,7 +3227,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         mergeConfigResolver,
-                        onDiskMerge
+                        onDiskMerge,
+                        rescoreBits
                     );
                 }
             } else if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE)) {
@@ -3224,6 +3278,52 @@ public class DenseVectorFieldMapper extends FieldMapper {
         }
 
         @Override
+        public boolean validateElementType(ElementType elementType) {
+            if (rescoreBits > 0 && elementType != ElementType.FLOAT) {
+                throw new IllegalArgumentException(
+                    "[rescore_bits] is only supported when [element_type] is [float], but it is [" + elementType + "]"
+                );
+            }
+            return super.validateElementType(elementType);
+        }
+
+        private static int parseRescoreBits(
+            String fieldName,
+            Object rescoreBitsNode,
+            boolean isAsh,
+            boolean doPrecondition,
+            boolean experimentalFeaturesEnabled,
+            IndexVersion indexVersion
+        ) {
+            int rescoreBits = XContentMapValues.nodeIntegerValue(rescoreBitsNode);
+            if (rescoreBits < ESNextDiskBBQVectorsFormat.MIN_RESCORE_BITS || rescoreBits > ESNextDiskBBQVectorsFormat.MAX_RESCORE_BITS) {
+                throw new IllegalArgumentException(
+                    "[rescore_bits] must be between "
+                        + ESNextDiskBBQVectorsFormat.MIN_RESCORE_BITS
+                        + " and "
+                        + ESNextDiskBBQVectorsFormat.MAX_RESCORE_BITS
+                        + ", got: "
+                        + rescoreBits
+                        + " for field ["
+                        + fieldName
+                        + "]"
+                );
+            }
+            if (isAsh) {
+                throw new IllegalArgumentException("[rescore_bits] is not supported with quantization_type [ash] for field [" + fieldName + "]");
+            }
+            if (doPrecondition) {
+                throw new IllegalArgumentException("[rescore_bits] is not supported with [precondition] for field [" + fieldName + "]");
+            }
+            if (experimentalFeaturesEnabled == false || indexVersion.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE) == false) {
+                throw new IllegalArgumentException(
+                    "[rescore_bits] requires the experimental dense vector features for field [" + fieldName + "]"
+                );
+            }
+            return rescoreBits;
+        }
+
+        @Override
         boolean doEquals(DenseVectorIndexOptions other) {
             BBQIVFIndexOptions that = (BBQIVFIndexOptions) other;
             return clusterSize == that.clusterSize
@@ -3232,6 +3332,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 && onDiskRescore == that.onDiskRescore
                 && bits == that.bits
                 && doPrecondition == that.doPrecondition
+                && rescoreBits == that.rescoreBits
                 && Objects.equals(autoCalibrate, that.autoCalibrate)
                 && Objects.equals(quantizationType, that.quantizationType)
                 && Objects.equals(rescoreVector, that.rescoreVector);
@@ -3246,6 +3347,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 onDiskRescore,
                 bits,
                 doPrecondition,
+                rescoreBits,
                 autoCalibrate,
                 quantizationType,
                 rescoreVector
@@ -3272,6 +3374,9 @@ public class DenseVectorFieldMapper extends FieldMapper {
             builder.field("bits", bits);
             if (doPrecondition) {
                 builder.field("precondition", doPrecondition);
+            }
+            if (rescoreBits > 0) {
+                builder.field("rescore_bits", rescoreBits);
             }
             autoCalibrate.toXContent(builder, params);
             if (quantizationType == QuantizationType.ASH) {
@@ -3311,6 +3416,11 @@ public class DenseVectorFieldMapper extends FieldMapper {
             return bits;
         }
 
+        /** Bits per dimension of the residual codes stored for quantized rescoring, or {@code 0} when none are stored. */
+        public int getRescoreBits() {
+            return rescoreBits;
+        }
+
         public QuantizationType getQuantizationType() {
             return quantizationType;
         }
@@ -3333,6 +3443,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 + doPrecondition
                 + ", bits="
                 + bits
+                + ", rescore_bits="
+                + rescoreBits
                 + ", auto_calibrate="
                 + autoCalibrate
                 + ", on_disk_merge="
@@ -3675,6 +3787,42 @@ public class DenseVectorFieldMapper extends FieldMapper {
             float postFilterSelectivityThreshold,
             @Nullable SearchExecutionContext context
         ) {
+            return createKnnQuery(
+                queryVector,
+                k,
+                numCands,
+                visitPercentage,
+                oversample,
+                null,
+                filter,
+                similarityThreshold,
+                parentFilter,
+                heuristic,
+                hnswEarlyTermination,
+                postFilterSelectivityThreshold,
+                context
+            );
+        }
+
+        /**
+         * @param quantizedRescore {@code false} to rescore with raw vectors even where a segment stores quantized residual codes
+         *                         for the field, {@code true} or {@code null} to prefer the residual codes where present
+         */
+        public Query createKnnQuery(
+            VectorData queryVector,
+            int k,
+            int numCands,
+            Float visitPercentage,
+            Float oversample,
+            @Nullable Boolean quantizedRescore,
+            Query filter,
+            Float similarityThreshold,
+            BitSetProducer parentFilter,
+            FilterHeuristic heuristic,
+            boolean hnswEarlyTermination,
+            float postFilterSelectivityThreshold,
+            @Nullable SearchExecutionContext context
+        ) {
             if (indexType.hasVectors() == false) {
                 throw new IllegalArgumentException(
                     "to perform knn search on field [" + name() + "], its mapping must have [index] set to [true]"
@@ -3712,6 +3860,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     numCands,
                     visitPercentage,
                     oversample,
+                    quantizedRescore == null || quantizedRescore,
                     filter,
                     similarityThreshold,
                     parentFilter,
@@ -3944,6 +4093,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
             int numCands,
             Float visitPercentage,
             Float queryOversample,
+            boolean useQuantizedRescore,
             Query filter,
             Float similarityThreshold,
             BitSetProducer parentFilter,
@@ -3985,7 +4135,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     bbqIndexOptions.bits,
                     mappingOversample,
                     queryOversample
-                );
+                ).withQuantizedRescore(useQuantizedRescore);
                 if (sliceIds != null) {
                     knnQuery = parentFilter != null
                         ? new DiversifyingChildrenIVFKnnFloatSlicedVectorQuery(
@@ -4051,7 +4201,14 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 knnQuery = new PostFilterKnnQuery(pfknnQuery, filter, k, name(), parentFilter, postFilterSelectivityThreshold);
             }
             if (rescore) {
-                knnQuery = RescoreKnnVectorQuery.fromInnerQuery(name(), queryVector, k, adjustedKForRescoring, knnQuery);
+                knnQuery = RescoreKnnVectorQuery.fromInnerQuery(
+                    name(),
+                    queryVector,
+                    k,
+                    adjustedKForRescoring,
+                    knnQuery,
+                    useQuantizedRescore
+                );
             }
             if (similarityThreshold != null) {
                 knnQuery = new VectorSimilarityQuery(

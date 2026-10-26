@@ -10,6 +10,7 @@
 package org.elasticsearch.index.codec.vectors.diskbbq.next;
 
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.VectorEncoding;
@@ -38,6 +39,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.PostingMetadata;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.SegmentCalibrationParameters;
 import org.elasticsearch.index.codec.vectors.diskbbq.SlicedBlockRange;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
@@ -63,7 +65,8 @@ import static org.elasticsearch.simdvec.ES940OSQVectorsScorer.BULK_SIZE;
 public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVectorsReader.NextFieldEntry>
     implements
         VectorPreconditioner,
-        CalibrationAwareReader {
+        CalibrationAwareReader,
+        QuantizedRescoringReader {
 
     public ESNextDiskBBQVectorsReader(SegmentReadState state, GenericFlatVectorReaders.LoadFlatVectorsReader getFormatReader)
         throws IOException {
@@ -209,6 +212,16 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         float rescoreOversample = Float.intBitsToFloat(input.readInt());
         // ESNext format extension: byte centroid flag
         boolean byteCentroids = input.readByte() == 1;
+        int rescoreBits = 0;
+        long rescoreSectionOffset = 0;
+        long rescoreSectionLength = 0;
+        if (versionMeta >= ESNextDiskBBQVectorsFormat.VERSION_RESCORE_BITS) {
+            rescoreBits = input.readInt();
+            if (rescoreBits > 0) {
+                rescoreSectionOffset = input.readLong();
+                rescoreSectionLength = input.readLong();
+            }
+        }
         return new NextFieldEntry(
             rawVectorFormat,
             useDirectIOReads,
@@ -229,8 +242,29 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             numSlices,
             maxSliceSize,
             rescoreOversample,
-            byteCentroids
+            byteCentroids,
+            rescoreBits,
+            rescoreSectionOffset,
+            rescoreSectionLength
         );
+    }
+
+    @Override
+    public FloatVectorValues getQuantizedRescoreValues(String field) throws IOException {
+        final FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+        if (fieldInfo == null) {
+            return null;
+        }
+        final NextFieldEntry entry = fields.get(fieldInfo.number);
+        if (entry == null || entry.rescoreBits() == 0) {
+            return null;
+        }
+        final FloatVectorValues rawValues = getFloatVectorValues(field);
+        if (rawValues == null) {
+            return null;
+        }
+        final IndexInput sectionInput = ivfCentroids.slice("quantized-rescore", entry.rescoreSectionOffset(), entry.rescoreSectionLength());
+        return QuantizedRescoreValues.open(rawValues, sectionInput, entry.similarityFunction(), entry.globalCentroid());
     }
 
     @Override
@@ -351,6 +385,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final int maxSliceSize;
         private final float rescoreOversample;
         private final boolean byteCentroids;
+        private final int rescoreBits;
+        private final long rescoreSectionOffset;
+        private final long rescoreSectionLength;
 
         NextFieldEntry(
             String rawVectorFormat,
@@ -372,7 +409,10 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             int numSlices,
             int maxSliceSize,
             float rescoreOversample,
-            boolean byteCentroids
+            boolean byteCentroids,
+            int rescoreBits,
+            long rescoreSectionOffset,
+            long rescoreSectionLength
         ) {
             super(
                 rawVectorFormat,
@@ -396,6 +436,22 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             this.maxSliceSize = maxSliceSize;
             this.rescoreOversample = rescoreOversample;
             this.byteCentroids = byteCentroids;
+            this.rescoreBits = rescoreBits;
+            this.rescoreSectionOffset = rescoreSectionOffset;
+            this.rescoreSectionLength = rescoreSectionLength;
+        }
+
+        /** Bits per dimension of the stored residual codes, or {@code 0} when this segment has none for the field. */
+        public int rescoreBits() {
+            return rescoreBits;
+        }
+
+        public long rescoreSectionOffset() {
+            return rescoreSectionOffset;
+        }
+
+        public long rescoreSectionLength() {
+            return rescoreSectionLength;
         }
 
         public CentroidIndexFormat centroidIndexFormat() {

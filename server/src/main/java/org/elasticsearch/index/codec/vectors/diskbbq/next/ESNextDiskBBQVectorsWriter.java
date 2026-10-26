@@ -103,6 +103,10 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
     private final String sliceField;
     private final IvfFlushConfigSource flushConfigSource;
     private final IvfMergeConfigResolver mergeConfigResolver;
+    private final int rescoreBits;
+    // the config resolved for the field being written, and the quantized rescore section written for it, if any
+    private IvfSegmentConfig currentSegmentConfig;
+    private QuantizedRescoreWriter.Section pendingRescoreSection;
 
     @Override
     protected boolean supportsByteNative() {
@@ -126,7 +130,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         int flatVectorThreshold,
         String sliceField,
         IvfFlushConfigSource flushConfigSource,
-        IvfMergeConfigResolver mergeConfigResolver
+        IvfMergeConfigResolver mergeConfigResolver,
+        int rescoreBits
     ) throws IOException {
         super(
             state,
@@ -154,6 +159,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         this.sliceField = sliceField;
         this.flushConfigSource = flushConfigSource != null ? flushConfigSource : IvfFlushConfigSource.empty();
         this.mergeConfigResolver = mergeConfigResolver != null ? mergeConfigResolver : IvfMergeConfigResolver.useCodecDefault();
+        this.rescoreBits = rescoreBits;
     }
 
     @Override
@@ -163,15 +169,42 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             new IvfSegmentConfig.OsqConfig(quantEncoding),
             doPrecondition
         );
-        return flushConfigSource.load(segmentWriteState, fieldInfo).orElse(codec);
+        currentSegmentConfig = flushConfigSource.load(segmentWriteState, fieldInfo).orElse(codec);
+        return currentSegmentConfig;
     }
 
     @Override
     protected IvfSegmentConfig resolveMergeConfig(FieldInfo fieldInfo, MergeState mergeState) throws IOException {
-        return mergeConfigResolver.resolve(
+        currentSegmentConfig = mergeConfigResolver.resolve(
             fieldInfo,
             mergeState,
             IvfSegmentConfig.fromCodecDefaults(centroidIndexFormat, new IvfSegmentConfig.OsqConfig(quantEncoding), doPrecondition)
+        );
+        return currentSegmentConfig;
+    }
+
+    /**
+     * The residual codes are computed from the vectors as they are indexed, so they are only valid for the raw vectors when
+     * the segment does not precondition (rotate) the vectors it clusters and quantizes.
+     */
+    @Override
+    protected void writeExtraFieldData(
+        FieldInfo fieldInfo,
+        ClusteringVectorValues<?> vectors,
+        float[] globalCentroid,
+        IndexOutput centroidOutput
+    ) throws IOException {
+        pendingRescoreSection = null;
+        if (rescoreBits == 0 || currentSegmentConfig == null || currentSegmentConfig.usePrecondition()) {
+            return;
+        }
+        pendingRescoreSection = QuantizedRescoreWriter.write(
+            fieldInfo,
+            vectors,
+            globalCentroid,
+            currentSegmentConfig.osqEncoding().bits(),
+            rescoreBits,
+            centroidOutput
         );
     }
 
@@ -718,6 +751,14 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         // ESNext format extension: byte centroid flag — indicates whether raw centroids
         // are stored as 1 byte/dim (byte fields) or 4 bytes/dim (float fields).
         metaOutput.writeByte(byteCentroids ? (byte) 1 : (byte) 0);
+        if (pendingRescoreSection == null) {
+            metaOutput.writeInt(0);
+        } else {
+            metaOutput.writeInt(rescoreBits);
+            metaOutput.writeLong(pendingRescoreSection.offset());
+            metaOutput.writeLong(pendingRescoreSection.length());
+            pendingRescoreSection = null;
+        }
     }
 
     @Override

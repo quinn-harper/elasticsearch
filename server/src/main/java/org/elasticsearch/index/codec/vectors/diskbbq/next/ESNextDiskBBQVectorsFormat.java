@@ -65,7 +65,10 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
     public static final int VERSION_START = 1;
     public static final int VERSION_DIRECT_IO = VERSION_START;
     public static final int VERSION_ON_DISK_MERGE = VERSION_START;
-    public static final int VERSION_CURRENT = VERSION_START;
+    public static final int VERSION_RESCORE_BITS = 2;
+    public static final int VERSION_CURRENT = VERSION_RESCORE_BITS;
+    public static final int MIN_RESCORE_BITS = 1;
+    public static final int MAX_RESCORE_BITS = 8;
     public static final float DYNAMIC_VISIT_RATIO = 0.0f;
 
     private static final DirectIOCapableFlatVectorsFormat float32VectorFormat = new DirectIOCapableLucene99FlatVectorsFormat(
@@ -118,6 +121,7 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
     private final String sliceField;
     private final IvfFlushConfigSource ivfFlushConfigSource;
     private final IvfMergeConfigResolver ivfMergeConfigResolver;
+    private final int rescoreBits;
 
     public ESNextDiskBBQVectorsFormat(int vectorPerCluster, int centroidsPerParentCluster, String sliceField) {
         this(QuantEncoding.ONE_BIT_4BIT_QUERY, vectorPerCluster, centroidsPerParentCluster, sliceField);
@@ -224,7 +228,58 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
         IvfMergeConfigResolver ivfMergeConfigResolver,
         boolean onDiskMerge
     ) {
+        this(
+            quantEncoding,
+            vectorPerCluster,
+            centroidsPerParentCluster,
+            elementType,
+            useDirectIO,
+            mergingExecutorService,
+            maxMergingWorkers,
+            doPrecondition,
+            preconditioningBlockDimension,
+            flatVectorThreshold,
+            sliceField,
+            ivfFlushConfigSource,
+            ivfMergeConfigResolver,
+            onDiskMerge,
+            0
+        );
+    }
+
+    /**
+     * @param rescoreBits number of bits per dimension of the residual codes stored for quantized rescoring, or {@code 0} to store none.
+     *                    Only supported for float vectors without preconditioning.
+     */
+    public ESNextDiskBBQVectorsFormat(
+        QuantEncoding quantEncoding,
+        int vectorPerCluster,
+        int centroidsPerParentCluster,
+        DenseVectorFieldMapper.ElementType elementType,
+        boolean useDirectIO,
+        ExecutorService mergingExecutorService,
+        int maxMergingWorkers,
+        boolean doPrecondition,
+        int preconditioningBlockDimension,
+        int flatVectorThreshold,
+        String sliceField,
+        IvfFlushConfigSource ivfFlushConfigSource,
+        IvfMergeConfigResolver ivfMergeConfigResolver,
+        boolean onDiskMerge,
+        int rescoreBits
+    ) {
         super(NAME);
+        if (rescoreBits != 0 && (rescoreBits < MIN_RESCORE_BITS || rescoreBits > MAX_RESCORE_BITS)) {
+            throw new IllegalArgumentException(
+                "rescoreBits must be 0 or between " + MIN_RESCORE_BITS + " and " + MAX_RESCORE_BITS + ", got: " + rescoreBits
+            );
+        }
+        if (rescoreBits != 0 && doPrecondition) {
+            throw new IllegalArgumentException("rescoreBits is not supported together with preconditioning");
+        }
+        if (rescoreBits != 0 && elementType != DenseVectorFieldMapper.ElementType.FLOAT) {
+            throw new IllegalArgumentException("rescoreBits is only supported for float vectors, got element type: " + elementType);
+        }
         if (vectorPerCluster < MIN_VECTORS_PER_CLUSTER || vectorPerCluster > MAX_VECTORS_PER_CLUSTER) {
             throw new IllegalArgumentException(
                 "vectorsPerCluster must be between "
@@ -280,6 +335,7 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
         this.sliceField = sliceField;
         this.ivfFlushConfigSource = ivfFlushConfigSource;
         this.ivfMergeConfigResolver = ivfMergeConfigResolver;
+        this.rescoreBits = rescoreBits;
     }
 
     /** Constructs a format using the given graph construction parameters and scalar quantization. */
@@ -307,7 +363,8 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
             flatVectorThreshold,
             sliceField,
             ivfFlushConfigSource,
-            ivfMergeConfigResolver
+            ivfMergeConfigResolver,
+            rescoreBits
         );
     }
 

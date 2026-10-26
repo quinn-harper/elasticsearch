@@ -184,6 +184,7 @@ public class MapperFeatures implements FeatureSpecification {
     );
     public static final NodeFeature PUT_MAPPING_NO_TYPES_CHECK = new NodeFeature("indices.put_mapping.no_types_check");
     public static final NodeFeature DENSE_VECTOR_ON_DISK_MERGE = new NodeFeature("mapper.vectors.on_disk_merge");
+    public static final NodeFeature DISKBBQ_RESCORE_BITS = new NodeFeature("mapper.vectors.diskbbq_rescore_bits");
     public static final NodeFeature DENSE_VECTOR_UNIFIED_VALUE_FORMATS = new NodeFeature("mapper.dense_vector.unified_value_formats");
     public static final NodeFeature FIX_SORTED_NUMERIC_WITH_OFFSETS_EMPTY_ARRAY = new NodeFeature(
         "mapper.fix_sorted_numeric_with_offsets_empty_array"
@@ -246,6 +247,7 @@ public class MapperFeatures implements FeatureSpecification {
             PATTERN_TEXT_RENAME,
             DISKBBQ_ON_DISK_RESCORING,
             DENSE_VECTOR_ON_DISK_MERGE,
+            DISKBBQ_RESCORE_BITS,
             PROVIDE_INDEX_SORT_SETTING_DEFAULTS,
             INDEX_MAPPING_IGNORE_DYNAMIC_BEYOND_FIELD_NAME_LIMIT,
             EXCLUDE_VECTORS_DOCVALUE_BUGFIX,
