@@ -30,7 +30,8 @@ public record SearchParameters(
     boolean postFilter,
     long seed,
     boolean exact,
-    boolean exactQuantized
+    boolean exactQuantized,
+    boolean quantizedRescore
 ) {
 
     static final ObjectParser<SearchParameters.Builder, Void> PARSER = new ObjectParser<>(
@@ -53,6 +54,7 @@ public record SearchParameters(
         PARSER.declareLong(Builder::setSeed, TestConfiguration.SEED_FIELD);
         PARSER.declareBoolean(Builder::setExact, TestConfiguration.EXACT_FIELD);
         PARSER.declareBoolean(Builder::setExactQuantized, TestConfiguration.EXACT_QUANTIZED_FIELD);
+        PARSER.declareBoolean(Builder::setQuantizedRescore, TestConfiguration.QUANTIZED_RESCORE_FIELD);
     }
 
     static SearchParameters.Builder fromXContent(XContentParser parser) {
@@ -77,6 +79,7 @@ public record SearchParameters(
         private Long seed;
         private Boolean exact;
         private Boolean exactQuantized;
+        private Boolean quantizedRescore;
 
         public Builder setNumCandidates(int numCandidates) {
             this.numCandidates = numCandidates;
@@ -143,6 +146,11 @@ public record SearchParameters(
             return this;
         }
 
+        public Builder setQuantizedRescore(boolean quantizedRescore) {
+            this.quantizedRescore = quantizedRescore;
+            return this;
+        }
+
         private Builder setNullValues(SearchParameters params) {
             // Only set the null members, don't overwrite the set values
             this.numCandidates = Optional.ofNullable(numCandidates).orElse(params.numCandidates());
@@ -158,6 +166,7 @@ public record SearchParameters(
             this.seed = Optional.ofNullable(seed).orElse(params.seed());
             this.exact = Optional.ofNullable(exact).orElse(params.exact());
             this.exactQuantized = Optional.ofNullable(exactQuantized).orElse(params.exactQuantized());
+            this.quantizedRescore = Optional.ofNullable(quantizedRescore).orElse(params.quantizedRescore());
             return this;
         }
 
@@ -188,7 +197,8 @@ public record SearchParameters(
                 postFilter,
                 seed,
                 exact,
-                exactQuantized
+                exactQuantized,
+                quantizedRescore
             );
         }
 
@@ -233,6 +243,9 @@ public record SearchParameters(
             }
             if (exactQuantized != null) {
                 builder.field(TestConfiguration.EXACT_QUANTIZED_FIELD.getPreferredName(), exactQuantized);
+            }
+            if (quantizedRescore != null) {
+                builder.field(TestConfiguration.QUANTIZED_RESCORE_FIELD.getPreferredName(), quantizedRescore);
             }
             return builder.endObject();
         }

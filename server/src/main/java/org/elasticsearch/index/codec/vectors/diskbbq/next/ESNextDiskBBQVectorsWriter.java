@@ -184,8 +184,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
     }
 
     /**
-     * The residual codes are computed from the vectors as they are indexed, so they are only valid for the raw vectors when
-     * the segment does not precondition (rotate) the vectors it clusters and quantizes.
+     * The vectors and the global centroid passed in are in the space the segment clusters and quantizes in, which is the rotated
+     * space when the segment is preconditioned. The section is written in that same space, and the reader rotates the query to
+     * match with the segment's preconditioner.
      */
     @Override
     protected void writeExtraFieldData(
@@ -195,7 +196,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         IndexOutput centroidOutput
     ) throws IOException {
         pendingRescoreSection = null;
-        if (rescoreBits == 0 || currentSegmentConfig == null || currentSegmentConfig.usePrecondition()) {
+        if (rescoreBits == 0 || currentSegmentConfig == null) {
             return;
         }
         pendingRescoreSection = QuantizedRescoreWriter.write(

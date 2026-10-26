@@ -267,6 +267,9 @@ public class KnnIndexTester {
             // Keep cached indices built with the old raw-partition layout separate from the hash-prefixed slice-key layout.
             suffix.add("slice-key-v1");
         }
+        if (args.rescoreBits() > 0) {
+            suffix.add("rb" + args.rescoreBits());
+        }
         if (dirConfig.requiresFreshIndex()) {
             // These types rebuild the index on every run and wipe the index path doing so, so they must not share it with the
             // types that can reuse an index built by "default".
@@ -334,7 +337,8 @@ public class KnnIndexTester {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         mergeConfigResolver,
-                        false
+                        false,
+                        args.rescoreBits()
                     );
                 }
             }
@@ -1064,7 +1068,8 @@ public class KnnIndexTester {
                 "early_termination",
                 "post_filter",
                 "exact",
-                "exact_quantized"
+                "exact_quantized",
+                "quantized_rescore"
             );
             if (hasPartitionRecall) {
                 searchHeaderList.add("partition_recall_min");
@@ -1112,7 +1117,8 @@ public class KnnIndexTester {
                     Boolean.toString(queryResult.earlyTermination),
                     Boolean.toString(queryResult.postFilter),
                     Boolean.toString(queryResult.exact),
-                    Boolean.toString(queryResult.exactQuantized)
+                    Boolean.toString(queryResult.exactQuantized),
+                    Boolean.toString(queryResult.quantizedRescore)
                 );
                 if (hasPartitionRecall) {
                     String partitionMin = "";
@@ -1214,6 +1220,7 @@ public class KnnIndexTester {
         boolean postFilter;
         boolean exact;
         boolean exactQuantized;
+        boolean quantizedRescore;
         int numCandidates;
         int topK;
         Map<String, Float> perPartitionRecall;
@@ -1348,6 +1355,7 @@ public class KnnIndexTester {
         "secondary_cluster_size",
         "merge_policy",
         "on_disk_rescore",
+        "rescore_bits",
         "precondition",
         "flat_vector_threshold",
         "top_k",
@@ -1358,6 +1366,7 @@ public class KnnIndexTester {
         "post_filter",
         "exact",
         "exact_quantized",
+        "quantized_rescore",
         "filter_selectivity",
         "filter_cached",
         "search_threads",
@@ -1463,6 +1472,7 @@ public class KnnIndexTester {
                             Integer.toString(config.secondaryClusterSize()),
                             config.mergePolicy() != null ? config.mergePolicy().name().toLowerCase(Locale.ROOT) : "",
                             Boolean.toString(config.onDiskRescore()),
+                            Integer.toString(config.rescoreBits()),
                             Boolean.toString(config.doPrecondition()),
                             Integer.toString(config.flatVectorThreshold()),
                             Integer.toString(sp.topK()),
@@ -1473,6 +1483,7 @@ public class KnnIndexTester {
                             Boolean.toString(sp.postFilter()),
                             Boolean.toString(sp.exact()),
                             Boolean.toString(sp.exactQuantized()),
+                            Boolean.toString(sp.quantizedRescore()),
                             String.format(Locale.ROOT, "%.4f", sp.filterSelectivity()),
                             Boolean.toString(sp.filterCached()),
                             Integer.toString(sp.searchThreads()),

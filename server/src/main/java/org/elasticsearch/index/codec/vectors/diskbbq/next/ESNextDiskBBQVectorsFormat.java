@@ -249,7 +249,7 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
 
     /**
      * @param rescoreBits number of bits per dimension of the residual codes stored for quantized rescoring, or {@code 0} to store none.
-     *                    Only supported for float vectors without preconditioning.
+     *                    Supported for float and bfloat16 vectors, with or without preconditioning.
      */
     public ESNextDiskBBQVectorsFormat(
         QuantEncoding quantEncoding,
@@ -274,11 +274,8 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
                 "rescoreBits must be 0 or between " + MIN_RESCORE_BITS + " and " + MAX_RESCORE_BITS + ", got: " + rescoreBits
             );
         }
-        if (rescoreBits != 0 && doPrecondition) {
-            throw new IllegalArgumentException("rescoreBits is not supported together with preconditioning");
-        }
-        if (rescoreBits != 0 && elementType != DenseVectorFieldMapper.ElementType.FLOAT) {
-            throw new IllegalArgumentException("rescoreBits is only supported for float vectors, got element type: " + elementType);
+        if (rescoreBits != 0 && elementType == DenseVectorFieldMapper.ElementType.BYTE) {
+            throw new IllegalArgumentException("rescoreBits is not supported for byte vectors");
         }
         if (vectorPerCluster < MIN_VECTORS_PER_CLUSTER || vectorPerCluster > MAX_VECTORS_PER_CLUSTER) {
             throw new IllegalArgumentException(

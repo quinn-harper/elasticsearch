@@ -34,8 +34,10 @@ import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.TestUtil;
 import org.elasticsearch.common.lucene.Lucene;
+import org.elasticsearch.index.codec.vectors.diskbbq.CentroidIndexFormat;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
@@ -44,7 +46,9 @@ import org.elasticsearch.test.ESTestCase;
 
 import java.io.IOException;
 import java.util.HashSet;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION;
 import static org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat.defaultFlatThreshold;
@@ -66,20 +70,29 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
     private static final int VECTORS_PER_CLUSTER = 128;
 
     private static Codec codec(int rescoreBits) {
+        return codec(rescoreBits, false, DenseVectorFieldMapper.ElementType.FLOAT, IvfFlushConfigSource.empty());
+    }
+
+    private static Codec codec(
+        int rescoreBits,
+        boolean doPrecondition,
+        DenseVectorFieldMapper.ElementType elementType,
+        IvfFlushConfigSource flushConfigSource
+    ) {
         return TestUtil.alwaysKnnVectorsFormat(
             new ESNextDiskBBQVectorsFormat(
                 QuantEncoding.ONE_BIT_4BIT_QUERY,
                 VECTORS_PER_CLUSTER,
                 ESNextDiskBBQVectorsFormat.MIN_CENTROIDS_PER_PARENT_CLUSTER,
-                DenseVectorFieldMapper.ElementType.FLOAT,
+                elementType,
                 false,
                 null,
                 1,
-                false,
+                doPrecondition,
                 DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
                 defaultFlatThreshold(VECTORS_PER_CLUSTER),
                 null,
-                IvfFlushConfigSource.empty(),
+                flushConfigSource,
                 IvfMergeConfigResolver.useCodecDefault(),
                 false,
                 rescoreBits
@@ -143,8 +156,17 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
 
     private static double meanScoreErrorAfterIndexing(int rescoreBits, VectorSimilarityFunction similarity, int numberOfVectors)
         throws IOException {
+        return meanScoreErrorAfterIndexing(
+            codec(rescoreBits),
+            similarity,
+            numberOfVectors
+        );
+    }
+
+    private static double meanScoreErrorAfterIndexing(Codec codec, VectorSimilarityFunction similarity, int numberOfVectors)
+        throws IOException {
         try (Directory directory = newDirectory()) {
-            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(rescoreBits));
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec);
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 addVectors(writer, numberOfVectors, similarity);
                 writer.commit();
@@ -168,6 +190,67 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         assertThat(fourBitError, lessThan(oneBitError));
         assertThat(eightBitError, lessThan(fourBitError));
         assertThat("eight bits should be nearly exact", eightBitError, lessThan(5e-3));
+    }
+
+    public void testPreconditionedSegmentsAreScoredInTheRotatedSpace() throws IOException {
+        final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
+        final int numberOfVectors = randomIntBetween(600, 1_200);
+        final DenseVectorFieldMapper.ElementType elementType = DenseVectorFieldMapper.ElementType.FLOAT;
+
+        final double oneBitError = meanScoreErrorAfterIndexing(
+            codec(1, true, elementType, IvfFlushConfigSource.empty()),
+            similarity,
+            numberOfVectors
+        );
+        final double eightBitError = meanScoreErrorAfterIndexing(
+            codec(8, true, elementType, IvfFlushConfigSource.empty()),
+            similarity,
+            numberOfVectors
+        );
+
+        assertThat(eightBitError, lessThan(oneBitError));
+        assertThat("eight bits should be nearly exact once the query is rotated like the vectors", eightBitError, lessThan(5e-3));
+    }
+
+    public void testSegmentsWithAndWithoutPreconditioningAreBothScoredCorrectly() throws IOException {
+        final VectorSimilarityFunction similarity = VectorSimilarityFunction.EUCLIDEAN;
+        final AtomicInteger flushes = new AtomicInteger();
+        final IvfFlushConfigSource alternatingPreconditioning = (state, fieldInfo) -> Optional.of(
+            IvfSegmentConfig.of(
+                CentroidIndexFormat.FLAT,
+                new IvfSegmentConfig.OsqConfig(QuantEncoding.ONE_BIT_4BIT_QUERY),
+                flushes.getAndIncrement() % 2 == 0,
+                DenseVectorFieldMapper.DEFAULT_OVERSAMPLE
+            )
+        );
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(
+                codec(8, false, DenseVectorFieldMapper.ElementType.FLOAT, alternatingPreconditioning)
+            );
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                for (int segment = 0; segment < 4; segment++) {
+                    addVectors(writer, randomIntBetween(400, 700), similarity);
+                    writer.commit();
+                }
+                try (DirectoryReader reader = DirectoryReader.open(writer)) {
+                    assertThat(reader.leaves().size(), greaterThanOrEqualTo(2));
+                    for (LeafReaderContext leaf : reader.leaves()) {
+                        assertThat(meanScoreError(leaf.reader(), similarity, randomUnitVector()), lessThan(5e-3));
+                    }
+                }
+            }
+        }
+    }
+
+    public void testBFloat16VectorsScoreCloseToTheRoundedRawVectors() throws IOException {
+        final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
+        final boolean doPrecondition = randomBoolean();
+        final double error = meanScoreErrorAfterIndexing(
+            codec(8, doPrecondition, DenseVectorFieldMapper.ElementType.BFLOAT16, IvfFlushConfigSource.empty()),
+            similarity,
+            randomIntBetween(600, 1_200)
+        );
+        assertThat("the error floor is set by bfloat16 rounding of the raw vectors", error, lessThan(2e-2));
     }
 
     public void testSectionIsRebuiltWhenSegmentsAreMerged() throws IOException {
@@ -281,9 +364,10 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
     public void testFormatRejectsUnsupportedRescoreBitsCombinations() {
         expectThrows(IllegalArgumentException.class, () -> formatWith(9, false, DenseVectorFieldMapper.ElementType.FLOAT));
         expectThrows(IllegalArgumentException.class, () -> formatWith(-1, false, DenseVectorFieldMapper.ElementType.FLOAT));
-        expectThrows(IllegalArgumentException.class, () -> formatWith(4, true, DenseVectorFieldMapper.ElementType.FLOAT));
         expectThrows(IllegalArgumentException.class, () -> formatWith(4, false, DenseVectorFieldMapper.ElementType.BYTE));
-        expectThrows(IllegalArgumentException.class, () -> formatWith(4, false, DenseVectorFieldMapper.ElementType.BFLOAT16));
+        formatWith(4, true, DenseVectorFieldMapper.ElementType.FLOAT);
+        formatWith(4, false, DenseVectorFieldMapper.ElementType.BFLOAT16);
+        formatWith(4, true, DenseVectorFieldMapper.ElementType.BFLOAT16);
     }
 
     private static ESNextDiskBBQVectorsFormat formatWith(

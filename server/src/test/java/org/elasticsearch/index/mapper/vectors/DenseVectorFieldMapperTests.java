@@ -1240,12 +1240,6 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
         );
         assertThat(ash.getMessage(), containsString("[rescore_bits] is not supported with quantization_type [ash]"));
 
-        Exception precondition = expectThrows(
-            MapperParsingException.class,
-            () -> createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(4, Map.of("precondition", true)))
-        );
-        assertThat(precondition.getMessage(), containsString("[rescore_bits] is not supported with [precondition]"));
-
         Exception notExperimental = expectThrows(
             MapperParsingException.class,
             () -> createMapperService(EXPERIMENTAL_FEATURES_DISABLED, rescoreBitsMapping(4))
@@ -1260,13 +1254,35 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
                     b -> new DenseVectorMappingBuilder().dims(128)
                         .index(true)
                         .similarity(VectorSimilarity.COSINE)
-                        .elementType(ElementType.BFLOAT16)
+                        .elementType(ElementType.BYTE)
                         .indexOptions(Map.of("type", "bbq_disk", "rescore_bits", 4))
                         .build(b)
                 )
             )
         );
-        assertThat(notFloat.getMessage(), containsString("[rescore_bits] is only supported when [element_type] is [float]"));
+        assertThat(notFloat.getMessage(), containsString("[rescore_bits] is only supported when [element_type] is [float] or [bfloat16]"));
+    }
+
+    public void testRescoreBitsIsAcceptedWithPreconditioningAndBFloat16() throws IOException {
+        assumeTrue("rescore_bits requires a snapshot build", Build.current().isSnapshot());
+
+        MapperService preconditioned = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(4, Map.of("precondition", true)));
+        var preconditionedOptions = getIndexOptions(preconditioned, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class);
+        assertEquals(4, preconditionedOptions.getRescoreBits());
+        assertTrue(preconditionedOptions.doPrecondition());
+
+        MapperService bfloat16 = createMapperService(
+            EXPERIMENTAL_FEATURES_ENABLED,
+            fieldMapping(
+                b -> new DenseVectorMappingBuilder().dims(128)
+                    .index(true)
+                    .similarity(VectorSimilarity.COSINE)
+                    .elementType(ElementType.BFLOAT16)
+                    .indexOptions(Map.of("type", "bbq_disk", "rescore_bits", 4))
+                    .build(b)
+            )
+        );
+        assertEquals(4, getIndexOptions(bfloat16, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).getRescoreBits());
     }
 
     public void testRescoreBitsCanBeChangedByMappingUpdate() throws IOException {

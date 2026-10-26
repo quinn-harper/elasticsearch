@@ -264,7 +264,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             return null;
         }
         final IndexInput sectionInput = ivfCentroids.slice("quantized-rescore", entry.rescoreSectionOffset(), entry.rescoreSectionLength());
-        return QuantizedRescoreValues.open(rawValues, sectionInput, entry.similarityFunction(), entry.globalCentroid());
+        final Preconditioner preconditioner = entry.preconditionerLength() > 0 ? getPreconditioner(fieldInfo) : null;
+        return QuantizedRescoreValues.open(rawValues, sectionInput, entry.similarityFunction(), entry.globalCentroid(), preconditioner);
     }
 
     @Override

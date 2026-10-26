@@ -2278,7 +2278,6 @@ public class DenseVectorFieldMapper extends FieldMapper {
                             fieldName,
                             rescoreBitsNode,
                             isAsh,
-                            doPrecondition,
                             experimentalFeaturesEnabled,
                             indexVersion
                         );
@@ -3279,9 +3278,9 @@ public class DenseVectorFieldMapper extends FieldMapper {
 
         @Override
         public boolean validateElementType(ElementType elementType) {
-            if (rescoreBits > 0 && elementType != ElementType.FLOAT) {
+            if (rescoreBits > 0 && elementType == ElementType.BYTE) {
                 throw new IllegalArgumentException(
-                    "[rescore_bits] is only supported when [element_type] is [float], but it is [" + elementType + "]"
+                    "[rescore_bits] is only supported when [element_type] is [float] or [bfloat16], but it is [" + elementType + "]"
                 );
             }
             return super.validateElementType(elementType);
@@ -3291,7 +3290,6 @@ public class DenseVectorFieldMapper extends FieldMapper {
             String fieldName,
             Object rescoreBitsNode,
             boolean isAsh,
-            boolean doPrecondition,
             boolean experimentalFeaturesEnabled,
             IndexVersion indexVersion
         ) {
@@ -3311,9 +3309,6 @@ public class DenseVectorFieldMapper extends FieldMapper {
             }
             if (isAsh) {
                 throw new IllegalArgumentException("[rescore_bits] is not supported with quantization_type [ash] for field [" + fieldName + "]");
-            }
-            if (doPrecondition) {
-                throw new IllegalArgumentException("[rescore_bits] is not supported with [precondition] for field [" + fieldName + "]");
             }
             if (experimentalFeaturesEnabled == false || indexVersion.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE) == false) {
                 throw new IllegalArgumentException(
