@@ -131,6 +131,46 @@ public class PooledLloydMaxQuantizerTests extends ESTestCase {
         return relativeSum / dimensions;
     }
 
+    public void testHeavilyTiedValuesStillGiveDistinctCodebookEntries() {
+        final int numberOfValues = 20_000;
+        final float[] values = new float[numberOfValues];
+        final float[] gaussians = gaussianValues(numberOfValues / 10, 1d);
+        System.arraycopy(gaussians, 0, values, 0, gaussians.length);
+        final int levels = 1 << randomIntBetween(4, 8);
+
+        final float[] codebook = PooledLloydMaxQuantizer.fitCodebook(values, levels);
+
+        assertThat(codebook.length, equalTo(levels));
+        for (int i = 1; i < codebook.length; i++) {
+            assertTrue("entry " + i + " repeats entry " + (i - 1), codebook[i - 1] < codebook[i]);
+        }
+    }
+
+    public void testPaddingDoesNotHurtTheErrorOnTiedValues() {
+        final int numberOfValues = 20_000;
+        final float[] values = new float[numberOfValues];
+        final float[] gaussians = gaussianValues(numberOfValues / 10, 1d);
+        System.arraycopy(gaussians, 0, values, 0, gaussians.length);
+
+        final float[] fewLevels = PooledLloydMaxQuantizer.fitCodebook(values.clone(), 16);
+        final float[] manyLevels = PooledLloydMaxQuantizer.fitCodebook(values.clone(), 256);
+
+        assertThat(meanSquaredError(values, manyLevels), lessThan(meanSquaredError(values, fewLevels)));
+    }
+
+    public void testConstantValuesDoNotFail() {
+        final float[] values = new float[500];
+        Arrays.fill(values, 0.25f);
+
+        final float[] codebook = PooledLloydMaxQuantizer.fitCodebook(values, 16);
+
+        assertThat(codebook.length, equalTo(16));
+        final PooledLloydMaxQuantizer quantizer = new PooledLloydMaxQuantizer(codebook, new float[] { 1f });
+        final int code = quantizer.encodeNormalized(0.25f);
+        assertTrue(code >= 0 && code < codebook.length);
+        assertEquals(0.25f, quantizer.decode(0, code), 1e-6f);
+    }
+
     public void testDimensionWithNoVarianceKeepsAFiniteScale() {
         final float[][] residuals = new float[100][2];
         for (float[] residual : residuals) {

@@ -66,7 +66,8 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
     public static final int VERSION_DIRECT_IO = VERSION_START;
     public static final int VERSION_ON_DISK_MERGE = VERSION_START;
     public static final int VERSION_RESCORE_BITS = 2;
-    public static final int VERSION_CURRENT = VERSION_RESCORE_BITS;
+    public static final int VERSION_RESCORE_PER_CLUSTER = 3;
+    public static final int VERSION_CURRENT = VERSION_RESCORE_PER_CLUSTER;
     public static final int MIN_RESCORE_BITS = 1;
     public static final int MAX_RESCORE_BITS = 8;
     public static final float DYNAMIC_VISIT_RATIO = 0.0f;

@@ -184,7 +184,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
     }
 
     /**
-     * The vectors and the global centroid passed in are in the space the segment clusters and quantizes in, which is the rotated
+     * The vectors and the centroids passed in are in the space the segment clusters and quantizes in, which is the rotated
      * space when the segment is preconditioned. The section is written in that same space, and the reader rotates the query to
      * match with the segment's preconditioner.
      */
@@ -193,6 +193,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         FieldInfo fieldInfo,
         ClusteringVectorValues<?> vectors,
         float[] globalCentroid,
+        CentroidSupplier centroidSupplier,
+        int[] assignments,
         IndexOutput centroidOutput
     ) throws IOException {
         pendingRescoreSection = null;
@@ -202,7 +204,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         pendingRescoreSection = QuantizedRescoreWriter.write(
             fieldInfo,
             vectors,
-            globalCentroid,
+            centroidSupplier,
+            assignments,
             currentSegmentConfig.osqEncoding().bits(),
             rescoreBits,
             centroidOutput
