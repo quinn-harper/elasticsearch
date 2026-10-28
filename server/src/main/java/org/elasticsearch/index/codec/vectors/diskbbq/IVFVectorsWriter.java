@@ -330,12 +330,15 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
      * Called for each field that got centroids, after its centroid data and preconditioner are written to
      * {@code centroidOutput} and immediately before its meta is written, on both flush and merge. A format can append extra
      * per field data to {@code centroidOutput} here and record it in {@link #doWriteMeta}. Vectors are in ordinal order and
-     * are the un-preconditioned vectors only when no preconditioner is used. The default does nothing.
+     * are the un-preconditioned vectors only when no preconditioner is used. The centroid supplier and the primary cluster
+     * assignment of every vector ordinal are those the posting lists were written with. The default does nothing.
      */
     protected void writeExtraFieldData(
         FieldInfo fieldInfo,
         ClusteringVectorValues<?> vectors,
         float[] globalCentroid,
+        CentroidSupplier centroidSupplier,
+        int[] assignments,
         IndexOutput centroidOutput
     ) throws IOException {}
 
@@ -435,7 +438,14 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             writePreconditioner(preconditioner, ivfCentroids);
             long preconditionerLength = ivfCentroids.getFilePointer() - preconditionerOffset;
 
-            writeExtraFieldData(fieldWriter.fieldInfo, clusteringVectorValues, globalCentroid, ivfCentroids);
+            writeExtraFieldData(
+                fieldWriter.fieldInfo,
+                clusteringVectorValues,
+                globalCentroid,
+                centroidSupplier,
+                centroidAssignments.assignments(),
+                ivfCentroids
+            );
 
             // write meta file
             writeMeta(
@@ -877,7 +887,14 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                     writePreconditioner(preconditioner, ivfCentroids);
                     long preconditionerLength = ivfCentroids.getFilePointer() - preconditionerOffset;
 
-                    writeExtraFieldData(fieldInfo, vectorValues, assignments.globalCentroid(), ivfCentroids);
+                    writeExtraFieldData(
+                        fieldInfo,
+                        vectorValues,
+                        assignments.globalCentroid(),
+                        centroidSupplier,
+                        assignments.assignments(),
+                        ivfCentroids
+                    );
 
                     assert assignments.centroidSlices() == null || assignments.centroidSlices().sliceOffsets().length > 0;
                     // write meta

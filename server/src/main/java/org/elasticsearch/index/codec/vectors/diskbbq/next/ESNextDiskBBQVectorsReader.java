@@ -263,9 +263,33 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         if (rawValues == null) {
             return null;
         }
+        if (versionMeta < ESNextDiskBBQVectorsFormat.VERSION_RESCORE_PER_CLUSTER) {
+            throw new IOException(
+                "field ["
+                    + field
+                    + "] has a quantized rescore section written with format version ["
+                    + versionMeta
+                    + "] which is no longer readable, reindex it or search without quantized rescoring"
+            );
+        }
+        if (entry.byteCentroids()) {
+            throw new IOException("field [" + field + "] has byte centroids, which quantized rescoring does not support");
+        }
         final IndexInput sectionInput = ivfCentroids.slice("quantized-rescore", entry.rescoreSectionOffset(), entry.rescoreSectionLength());
+        final IndexInput centroidsInput = rawCentroidsSlice(
+            entry.centroidSlice(ivfCentroids),
+            entry.numCentroids(),
+            fieldInfo.getVectorDimension(),
+            Float.BYTES
+        );
         final Preconditioner preconditioner = entry.preconditionerLength() > 0 ? getPreconditioner(fieldInfo) : null;
-        return QuantizedRescoreValues.open(rawValues, sectionInput, entry.similarityFunction(), entry.globalCentroid(), preconditioner);
+        return QuantizedRescoreValues.open(rawValues, sectionInput, centroidsInput, entry.similarityFunction(), preconditioner);
+    }
+
+    private static IndexInput rawCentroidsSlice(IndexInput centroidSlice, int numCentroids, int dimension, int bytesPerComponent)
+        throws IOException {
+        final long rawCentroidsSize = (long) numCentroids * dimension * bytesPerComponent;
+        return centroidSlice.slice("centroids-raw", centroidSlice.length() - rawCentroidsSize, rawCentroidsSize);
     }
 
     @Override
@@ -313,7 +337,6 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         // float-backed fields store centroids as 4 bytes (float) per dimension.
         boolean byteBacked = entry.byteCentroids();
         int bytesPerComponent = byteBacked ? Byte.BYTES : Float.BYTES;
-        long rawCentroidsSize = (long) numCentroids * dimension * bytesPerComponent;
 
         IndexInput centroidsSlice = null;
         boolean success = false;
@@ -329,8 +352,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             // The raw centroids live contiguously at the end of the centroid data; slice that
             // region and hand it to the streaming view. The slice owns its own resources and
             // outlives the parent centroidSlice.
-            long centroidsOffset = centroidSlice.length() - rawCentroidsSize;
-            centroidsSlice = centroidSlice.slice("centroids-raw", centroidsOffset, rawCentroidsSize);
+            centroidsSlice = rawCentroidsSlice(centroidSlice, numCentroids, dimension, bytesPerComponent);
             ClusteringVectorValues centroids;
             if (byteBacked) {
                 centroids = KMeansByteVectorValues.build(centroidsSlice, null, numCentroids, dimension);

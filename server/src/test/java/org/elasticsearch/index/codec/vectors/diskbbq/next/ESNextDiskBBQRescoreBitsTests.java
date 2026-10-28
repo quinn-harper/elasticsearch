@@ -135,12 +135,19 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
 
     /** The mean absolute difference between the quantized score and the exact score over every vector of the segment. */
     private static double meanScoreError(LeafReader leafReader, VectorSimilarityFunction similarity, float[] query) throws IOException {
+        return meanScoreError(leafReader, similarity, query, false);
+    }
+
+    private static double meanScoreError(LeafReader leafReader, VectorSimilarityFunction similarity, float[] query, boolean firstLevelOnly)
+        throws IOException {
         final FloatVectorValues quantized = quantizedReader(leafReader).getQuantizedRescoreValues(VECTOR_FIELD);
         assertThat(quantized, notNullValue());
         final FloatVectorValues raw = leafReader.getFloatVectorValues(VECTOR_FIELD);
         assertThat(quantized.size(), equalTo(raw.size()));
 
-        final VectorScorer scorer = quantized.rescorer(query);
+        final VectorScorer scorer = firstLevelOnly
+            ? ((QuantizedRescoreValues) quantized).firstLevelScorer(query)
+            : quantized.rescorer(query);
         final KnnVectorValues.DocIndexIterator rawIterator = raw.iterator();
         double totalError = 0;
         int scored = 0;
@@ -190,6 +197,57 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         assertThat(fourBitError, lessThan(oneBitError));
         assertThat(eightBitError, lessThan(fourBitError));
         assertThat("eight bits should be nearly exact", eightBitError, lessThan(5e-3));
+    }
+
+    public void testLookupScoresMatchScoringTheDecodedVector() throws IOException {
+        final VectorSimilarityFunction similarity = randomFrom(
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorSimilarityFunction.DOT_PRODUCT,
+            VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+        );
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(randomIntBetween(1, 8)));
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                addVectors(writer, randomIntBetween(600, 1_200), similarity);
+                writer.forceMerge(1);
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                final LeafReader leaf = reader.leaves().get(0).reader();
+                final FloatVectorValues quantized = quantizedReader(leaf).getQuantizedRescoreValues(VECTOR_FIELD);
+                final float[] query = randomUnitVector();
+                final VectorScorer scorer = quantized.rescorer(query);
+                final KnnVectorValues.DocIndexIterator iterator = leaf.getFloatVectorValues(VECTOR_FIELD).iterator();
+                int scored = 0;
+                for (int doc = iterator.nextDoc(); doc != KnnVectorValues.DocIndexIterator.NO_MORE_DOCS; doc = iterator.nextDoc()) {
+                    assertThat(scorer.iterator().advance(doc), equalTo(doc));
+                    final float decodedScore = similarity.compare(query, quantized.vectorValue(iterator.index()));
+                    assertEquals("ordinal " + iterator.index(), decodedScore, scorer.score(), 1e-4f);
+                    scored++;
+                }
+                assertThat(scored, equalTo(quantized.size()));
+            }
+        }
+    }
+
+    public void testResidualCodesImproveOnTheFirstLevelEstimate() throws IOException {
+        final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
+        final int numberOfVectors = randomIntBetween(600, 1_200);
+        for (int rescoreBits : new int[] { 2, 6 }) {
+            try (Directory directory = newDirectory()) {
+                final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(rescoreBits));
+                try (IndexWriter writer = new IndexWriter(directory, config)) {
+                    addVectors(writer, numberOfVectors, similarity);
+                    writer.forceMerge(1);
+                }
+                try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                    final LeafReader leaf = reader.leaves().get(0).reader();
+                    final float[] query = randomUnitVector();
+                    final double firstLevelError = meanScoreError(leaf, similarity, query, true);
+                    final double twoLevelError = meanScoreError(leaf, similarity, query, false);
+                    assertThat("rescoreBits=" + rescoreBits, twoLevelError, lessThan(firstLevelError));
+                }
+            }
+        }
     }
 
     public void testPreconditionedSegmentsAreScoredInTheRotatedSpace() throws IOException {

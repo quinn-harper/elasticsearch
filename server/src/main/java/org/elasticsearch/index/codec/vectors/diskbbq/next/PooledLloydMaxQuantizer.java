@@ -93,10 +93,7 @@ final class PooledLloydMaxQuantizer {
             prefixSums[i + 1] = prefixSums[i] + values[i];
         }
 
-        final float[] centroids = new float[levels];
-        for (int level = 0; level < levels; level++) {
-            centroids[level] = values[(int) (((level + 0.5d) * numberOfValues) / levels)];
-        }
+        final float[] centroids = initialCentroids(values, levels);
 
         final int[] regionStarts = new int[levels + 1];
         regionStarts[levels] = numberOfValues;
@@ -120,6 +117,35 @@ final class PooledLloydMaxQuantizer {
                     centroids[level] = (float) ((prefixSums[end] - prefixSums[start]) / (end - start));
                 }
             }
+        }
+        Arrays.sort(centroids);
+        return centroids;
+    }
+
+    /**
+     * Picks the centroids at evenly spaced quantiles of the sorted values. Heavily tied values make several quantiles
+     * hit the same value, and duplicate centroids would stay duplicates through every Lloyd iteration and waste codebook
+     * entries. Duplicates are therefore dropped and replaced by evenly spaced values strictly between the smallest and the
+     * largest value. If all values are equal there is nothing to spread over and the duplicates are kept.
+     */
+    private static float[] initialCentroids(float[] sortedValues, int levels) {
+        final int numberOfValues = sortedValues.length;
+        final float[] centroids = new float[levels];
+        int distinct = 0;
+        for (int level = 0; level < levels; level++) {
+            final float quantile = sortedValues[(int) (((level + 0.5d) * numberOfValues) / levels)];
+            if (distinct == 0 || quantile != centroids[distinct - 1]) {
+                centroids[distinct++] = quantile;
+            }
+        }
+        if (distinct == levels) {
+            return centroids;
+        }
+        final float smallest = sortedValues[0];
+        final float largest = sortedValues[numberOfValues - 1];
+        final int missing = levels - distinct;
+        for (int i = 0; i < missing; i++) {
+            centroids[distinct + i] = smallest == largest ? smallest : smallest + (largest - smallest) * (i + 1) / (missing + 1);
         }
         Arrays.sort(centroids);
         return centroids;
