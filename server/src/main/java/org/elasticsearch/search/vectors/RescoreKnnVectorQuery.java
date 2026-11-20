@@ -33,8 +33,10 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.ArrayUtil;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.index.codec.vectors.diskbbq.OrderedRescoreVectorValues;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.search.profile.query.QueryProfiler;
 
@@ -121,14 +123,23 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     protected final int k;
     protected final Query innerQuery;
     protected final boolean useQuantizedRescore;
+    protected final boolean sequentialRescoreRead;
     protected long vectorOperations = 0;
 
-    private RescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery, boolean useQuantizedRescore) {
+    private RescoreKnnVectorQuery(
+        String fieldName,
+        VectorQueryTarget target,
+        int k,
+        Query innerQuery,
+        boolean useQuantizedRescore,
+        boolean sequentialRescoreRead
+    ) {
         this.fieldName = fieldName;
         this.target = target;
         this.k = k;
         this.innerQuery = innerQuery;
         this.useQuantizedRescore = useQuantizedRescore;
+        this.sequentialRescoreRead = sequentialRescoreRead;
     }
 
     /**
@@ -158,7 +169,35 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         Query innerQuery,
         boolean useQuantizedRescore
     ) {
-        return fromInnerQuery(fieldName, new VectorQueryTarget.FloatTarget(floatTarget), k, rescoreK, innerQuery, useQuantizedRescore);
+        return fromInnerQuery(fieldName, floatTarget, k, rescoreK, innerQuery, useQuantizedRescore, false);
+    }
+
+    /**
+     * Same as {@link #fromInnerQuery(String, float[], int, int, Query, boolean)}, with control over how stored quantized residual
+     * codes are read.
+     *
+     * @param sequentialRescoreRead when {@code true} and the segment is rescored from stored quantized residual codes, the codes of
+     *                              all candidates of the segment are read in storage order. When {@code false} they are read one
+     *                              candidate at a time in document order.
+     */
+    public static RescoreKnnVectorQuery fromInnerQuery(
+        String fieldName,
+        float[] floatTarget,
+        int k,
+        int rescoreK,
+        Query innerQuery,
+        boolean useQuantizedRescore,
+        boolean sequentialRescoreRead
+    ) {
+        return fromInnerQuery(
+            fieldName,
+            new VectorQueryTarget.FloatTarget(floatTarget),
+            k,
+            rescoreK,
+            innerQuery,
+            useQuantizedRescore,
+            sequentialRescoreRead
+        );
     }
 
     /**
@@ -171,7 +210,7 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
      * @param innerQuery               the original Lucene query to rescore
      */
     public static RescoreKnnVectorQuery fromInnerQuery(String fieldName, byte[] byteTarget, int k, int rescoreK, Query innerQuery) {
-        return fromInnerQuery(fieldName, new VectorQueryTarget.ByteTarget(byteTarget), k, rescoreK, innerQuery, false);
+        return fromInnerQuery(fieldName, new VectorQueryTarget.ByteTarget(byteTarget), k, rescoreK, innerQuery, false, false);
     }
 
     private static RescoreKnnVectorQuery fromInnerQuery(
@@ -180,14 +219,15 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         int k,
         int rescoreK,
         Query innerQuery,
-        boolean useQuantizedRescore
+        boolean useQuantizedRescore,
+        boolean sequentialRescoreRead
     ) {
         if ((innerQuery instanceof KnnFloatVectorQuery fQuery && fQuery.getK() == rescoreK)
             || (innerQuery instanceof KnnByteVectorQuery bQuery && bQuery.getK() == rescoreK)) {
             // Queries that return only the top `k` results and do not require reduction before re-scoring.
-            return new InlineRescoreQuery(fieldName, target, k, innerQuery, useQuantizedRescore);
+            return new InlineRescoreQuery(fieldName, target, k, innerQuery, useQuantizedRescore, sequentialRescoreRead);
         }
-        return new LateRescoreQuery(fieldName, target, k, rescoreK, innerQuery, useQuantizedRescore);
+        return new LateRescoreQuery(fieldName, target, k, rescoreK, innerQuery, useQuantizedRescore, sequentialRescoreRead);
     }
 
     public Query innerQuery() {
@@ -221,12 +261,13 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             && Objects.equals(target, that.target)
             && Objects.equals(k, that.k)
             && Objects.equals(innerQuery, that.innerQuery)
-            && useQuantizedRescore == that.useQuantizedRescore;
+            && useQuantizedRescore == that.useQuantizedRescore
+            && sequentialRescoreRead == that.sequentialRescoreRead;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(fieldName, target, k, innerQuery, useQuantizedRescore);
+        return Objects.hash(fieldName, target, k, innerQuery, useQuantizedRescore, sequentialRescoreRead);
     }
 
     @Override
@@ -246,13 +287,20 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     }
 
     private static class InlineRescoreQuery extends RescoreKnnVectorQuery {
-        private InlineRescoreQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery, boolean useQuantizedRescore) {
-            super(fieldName, target, k, innerQuery, useQuantizedRescore);
+        private InlineRescoreQuery(
+            String fieldName,
+            VectorQueryTarget target,
+            int k,
+            Query innerQuery,
+            boolean useQuantizedRescore,
+            boolean sequentialRescoreRead
+        ) {
+            super(fieldName, target, k, innerQuery, useQuantizedRescore, sequentialRescoreRead);
         }
 
         @Override
         public Query rewrite(IndexSearcher searcher) throws IOException {
-            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, innerQuery, useQuantizedRescore);
+            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, innerQuery, useQuantizedRescore, sequentialRescoreRead);
             var topDocs = searcher.search(rescoreQuery, k);
             vectorOperations = topDocs.totalHits.value();
             return new KnnScoreDocQuery(topDocs.scoreDocs, searcher.getIndexReader());
@@ -280,9 +328,10 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             int k,
             int rescoreK,
             Query innerQuery,
-            boolean useQuantizedRescore
+            boolean useQuantizedRescore,
+            boolean sequentialRescoreRead
         ) {
-            super(fieldName, target, k, innerQuery, useQuantizedRescore);
+            super(fieldName, target, k, innerQuery, useQuantizedRescore, sequentialRescoreRead);
             this.rescoreK = rescoreK;
         }
 
@@ -295,7 +344,13 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
 
             // Retrieve top `k` documents from the top `rescoreK` query
             var topDocsQuery = new KnnScoreDocQuery(topDocs.scoreDocs, searcher.getIndexReader());
-            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, topDocsQuery, useQuantizedRescore);
+            var rescoreQuery = new DirectRescoreKnnVectorQuery(
+                fieldName,
+                target,
+                topDocsQuery,
+                useQuantizedRescore,
+                sequentialRescoreRead
+            );
             var rescoreTopDocs = searcher.search(rescoreQuery.rewrite(searcher), k);
             return new KnnScoreDocQuery(rescoreTopDocs.scoreDocs, searcher.getIndexReader());
         }
@@ -322,12 +377,20 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         private final String fieldName;
         private final Query innerQuery;
         private final boolean useQuantizedRescore;
+        private final boolean sequentialRescoreRead;
 
-        DirectRescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, Query innerQuery, boolean useQuantizedRescore) {
+        DirectRescoreKnnVectorQuery(
+            String fieldName,
+            VectorQueryTarget target,
+            Query innerQuery,
+            boolean useQuantizedRescore,
+            boolean sequentialRescoreRead
+        ) {
             this.fieldName = fieldName;
             this.target = target;
             this.innerQuery = innerQuery;
             this.useQuantizedRescore = useQuantizedRescore;
+            this.sequentialRescoreRead = sequentialRescoreRead;
         }
 
         @Override
@@ -473,6 +536,36 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
                 }
                 var filterIterator = scorer.iterator();
 
+                if (sequentialRescoreRead
+                    && target instanceof VectorQueryTarget.FloatTarget floatTarget
+                    && knnVectorValues instanceof OrderedRescoreVectorValues orderedValues) {
+                    KnnVectorValues.DocIndexIterator candidateIter = knnVectorValues.iterator();
+                    DocIdSetIterator candidates = ConjunctionUtils.intersectIterators(List.of(candidateIter, filterIterator));
+                    int[] candidateDocs = new int[BULK_SCORE_SIZE];
+                    int[] candidateOrds = new int[BULK_SCORE_SIZE];
+                    int candidateCount = 0;
+                    int candidateDoc;
+                    while ((candidateDoc = candidates.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                        if (candidateCount == candidateDocs.length) {
+                            candidateDocs = ArrayUtil.grow(candidateDocs, candidateCount + 1);
+                            candidateOrds = ArrayUtil.grow(candidateOrds, candidateCount + 1);
+                        }
+                        candidateDocs[candidateCount] = candidateDoc;
+                        candidateOrds[candidateCount] = candidateIter.index();
+                        candidateCount++;
+                    }
+                    if (candidateCount > 0) {
+                        float[] candidateScores = new float[candidateCount];
+                        orderedValues.scoreOrdinals(floatTarget.vector(), candidateOrds, candidateCount, candidateScores);
+                        for (int i = 0; i < candidateCount; i++) {
+                            if (Float.isNaN(candidateScores[i]) == false) {
+                                results.add(new ScoreDoc(candidateDocs[i] + leaf.docBase, candidateScores[i]));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 final int vectorByteSize = knnVectorValues.getVectorByteLength();
                 final IndexInput input = getIndexSliceOrNull(knnVectorValues);
                 KnnVectorValues.DocIndexIterator vectorIter = knnVectorValues.iterator();
@@ -586,12 +679,14 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             if (this == obj) return true;
             if (obj == null || getClass() != obj.getClass()) return false;
             DirectRescoreKnnVectorQuery that = (DirectRescoreKnnVectorQuery) obj;
-            return Objects.equals(innerQuery, that.innerQuery) && useQuantizedRescore == that.useQuantizedRescore;
+            return Objects.equals(innerQuery, that.innerQuery)
+                && useQuantizedRescore == that.useQuantizedRescore
+                && sequentialRescoreRead == that.sequentialRescoreRead;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(innerQuery, useQuantizedRescore, getClass());
+            return Objects.hash(innerQuery, useQuantizedRescore, sequentialRescoreRead, getClass());
         }
     }
 }

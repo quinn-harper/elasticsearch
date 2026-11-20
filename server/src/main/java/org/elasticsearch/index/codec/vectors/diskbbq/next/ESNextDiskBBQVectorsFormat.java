@@ -67,9 +67,9 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
     public static final int VERSION_ON_DISK_MERGE = VERSION_START;
     public static final int VERSION_RESCORE_BITS = 2;
     public static final int VERSION_RESCORE_PER_CLUSTER = 3;
-    public static final int VERSION_CURRENT = VERSION_RESCORE_PER_CLUSTER;
-    public static final int MIN_RESCORE_BITS = 1;
-    public static final int MAX_RESCORE_BITS = 8;
+    public static final int VERSION_RESCORE_CLUSTER_ORDER = 4;
+    public static final int VERSION_CURRENT = VERSION_RESCORE_CLUSTER_ORDER;
+    public static final int RESCORE_BITS = 8;
     public static final float DYNAMIC_VISIT_RATIO = 0.0f;
 
     private static final DirectIOCapableFlatVectorsFormat float32VectorFormat = new DirectIOCapableLucene99FlatVectorsFormat(
@@ -244,13 +244,13 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
             ivfFlushConfigSource,
             ivfMergeConfigResolver,
             onDiskMerge,
-            0
+            false
         );
     }
 
     /**
-     * @param rescoreBits number of bits per dimension of the residual codes stored for quantized rescoring, or {@code 0} to store none.
-     *                    Supported for float and bfloat16 vectors, with or without preconditioning.
+     * @param quantizedRescore whether to store {@link #RESCORE_BITS} bit residual codes for quantized rescoring.
+     *                         Supported for float and bfloat16 vectors, with or without preconditioning.
      */
     public ESNextDiskBBQVectorsFormat(
         QuantEncoding quantEncoding,
@@ -267,16 +267,11 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
         IvfFlushConfigSource ivfFlushConfigSource,
         IvfMergeConfigResolver ivfMergeConfigResolver,
         boolean onDiskMerge,
-        int rescoreBits
+        boolean quantizedRescore
     ) {
         super(NAME);
-        if (rescoreBits != 0 && (rescoreBits < MIN_RESCORE_BITS || rescoreBits > MAX_RESCORE_BITS)) {
-            throw new IllegalArgumentException(
-                "rescoreBits must be 0 or between " + MIN_RESCORE_BITS + " and " + MAX_RESCORE_BITS + ", got: " + rescoreBits
-            );
-        }
-        if (rescoreBits != 0 && elementType == DenseVectorFieldMapper.ElementType.BYTE) {
-            throw new IllegalArgumentException("rescoreBits is not supported for byte vectors");
+        if (quantizedRescore && elementType == DenseVectorFieldMapper.ElementType.BYTE) {
+            throw new IllegalArgumentException("quantized rescore is not supported for byte vectors");
         }
         if (vectorPerCluster < MIN_VECTORS_PER_CLUSTER || vectorPerCluster > MAX_VECTORS_PER_CLUSTER) {
             throw new IllegalArgumentException(
@@ -333,7 +328,7 @@ public class ESNextDiskBBQVectorsFormat extends KnnVectorsFormat {
         this.sliceField = sliceField;
         this.ivfFlushConfigSource = ivfFlushConfigSource;
         this.ivfMergeConfigResolver = ivfMergeConfigResolver;
-        this.rescoreBits = rescoreBits;
+        this.rescoreBits = quantizedRescore ? RESCORE_BITS : 0;
     }
 
     /** Constructs a format using the given graph construction parameters and scalar quantization. */

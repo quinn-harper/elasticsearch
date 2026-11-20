@@ -32,6 +32,7 @@ public class IvfQueryConfigResolver {
     private final float mappingRescoreOversample;
     private final Float queryOversample;
     private final boolean useQuantizedRescore;
+    private final boolean sequentialRescoreRead;
 
     public IvfQueryConfigResolver(
         boolean autoCalibrate,
@@ -40,7 +41,7 @@ public class IvfQueryConfigResolver {
         float mappingRescoreOversample,
         @Nullable Float queryOversample
     ) {
-        this(autoCalibrate, mappingUsePrecondition, quantBits, mappingRescoreOversample, queryOversample, true);
+        this(autoCalibrate, mappingUsePrecondition, quantBits, mappingRescoreOversample, queryOversample, true, false);
     }
 
     private IvfQueryConfigResolver(
@@ -49,7 +50,8 @@ public class IvfQueryConfigResolver {
         int quantBits,
         float mappingRescoreOversample,
         @Nullable Float queryOversample,
-        boolean useQuantizedRescore
+        boolean useQuantizedRescore,
+        boolean sequentialRescoreRead
     ) {
         this.autoCalibrate = autoCalibrate;
         this.mappingUsePrecondition = mappingUsePrecondition;
@@ -57,6 +59,7 @@ public class IvfQueryConfigResolver {
         this.mappingRescoreOversample = mappingRescoreOversample;
         this.queryOversample = queryOversample;
         this.useQuantizedRescore = useQuantizedRescore;
+        this.sequentialRescoreRead = sequentialRescoreRead;
     }
 
     /**
@@ -71,12 +74,33 @@ public class IvfQueryConfigResolver {
             quantBits,
             mappingRescoreOversample,
             queryOversample,
-            useQuantizedRescore
+            useQuantizedRescore,
+            sequentialRescoreRead
+        );
+    }
+
+    /**
+     * Returns a copy that reads the stored quantized residual codes of all rescoring candidates in storage order
+     * ({@code true}) or one candidate at a time in document order ({@code false}, the default).
+     */
+    public IvfQueryConfigResolver withSequentialRescoreRead(boolean sequentialRescoreRead) {
+        return new IvfQueryConfigResolver(
+            autoCalibrate,
+            mappingUsePrecondition,
+            quantBits,
+            mappingRescoreOversample,
+            queryOversample,
+            useQuantizedRescore,
+            sequentialRescoreRead
         );
     }
 
     public boolean useQuantizedRescore() {
         return useQuantizedRescore;
+    }
+
+    public boolean sequentialRescoreRead() {
+        return sequentialRescoreRead;
     }
 
     public static IvfQueryConfigResolver from(
@@ -159,11 +183,20 @@ public class IvfQueryConfigResolver {
             && quantBits == that.quantBits
             && mappingRescoreOversample == that.mappingRescoreOversample
             && Objects.equals(queryOversample, that.queryOversample)
-            && useQuantizedRescore == that.useQuantizedRescore;
+            && useQuantizedRescore == that.useQuantizedRescore
+            && sequentialRescoreRead == that.sequentialRescoreRead;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(autoCalibrate, mappingUsePrecondition, quantBits, mappingRescoreOversample, queryOversample, useQuantizedRescore);
+        return Objects.hash(
+            autoCalibrate,
+            mappingUsePrecondition,
+            quantBits,
+            mappingRescoreOversample,
+            queryOversample,
+            useQuantizedRescore,
+            sequentialRescoreRead
+        );
     }
 }

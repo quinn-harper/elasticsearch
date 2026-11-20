@@ -22,6 +22,8 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.packed.DirectReader;
 import org.apache.lucene.util.packed.DirectWriter;
+import org.elasticsearch.core.IOUtils;
+import org.elasticsearch.index.codec.vectors.DirectIOContext;
 import org.elasticsearch.index.codec.vectors.GenericFlatVectorReaders;
 import org.elasticsearch.index.codec.vectors.OptimizedScalarQuantizer;
 import org.elasticsearch.index.codec.vectors.cluster.ClusteringVectorValues;
@@ -43,6 +45,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.SegmentCalibrationParameters;
 import org.elasticsearch.index.codec.vectors.diskbbq.SlicedBlockRange;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
+import org.elasticsearch.index.store.FsDirectoryFactory;
 import org.elasticsearch.search.vectors.BulkKnnCollector;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
 import org.elasticsearch.simdvec.BulkMask;
@@ -68,6 +71,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         VectorPreconditioner,
         CalibrationAwareReader,
         QuantizedRescoringReader {
+
+    private volatile IndexInput directRescoreInput;
 
     public ESNextDiskBBQVectorsReader(SegmentReadState state, GenericFlatVectorReaders.LoadFlatVectorsReader getFormatReader)
         throws IOException {
@@ -264,7 +269,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         if (rawValues == null) {
             return null;
         }
-        if (versionMeta < ESNextDiskBBQVectorsFormat.VERSION_RESCORE_PER_CLUSTER) {
+        if (versionMeta < ESNextDiskBBQVectorsFormat.VERSION_RESCORE_CLUSTER_ORDER) {
             throw new IOException(
                 "field ["
                     + field
@@ -277,6 +282,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             throw new IOException("field [" + field + "] has byte centroids, which quantized rescoring does not support");
         }
         final IndexInput sectionInput = ivfCentroids.slice("quantized-rescore", entry.rescoreSectionOffset(), entry.rescoreSectionLength());
+        final IndexInput directRecordsInput = entry.useDirectIOReads() ? directRescoreInput() : null;
         final IndexInput centroidsInput = rawCentroidsSlice(
             entry.centroidSlice(ivfCentroids),
             entry.numCentroids(),
@@ -284,7 +290,46 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             Float.BYTES
         );
         final Preconditioner preconditioner = entry.preconditionerLength() > 0 ? getPreconditioner(fieldInfo) : null;
-        return QuantizedRescoreValues.open(rawValues, sectionInput, centroidsInput, entry.similarityFunction(), preconditioner);
+        return QuantizedRescoreValues.open(
+            rawValues,
+            sectionInput,
+            directRecordsInput == null
+                ? null
+                : directRecordsInput.slice("quantized-rescore-direct", entry.rescoreSectionOffset(), entry.rescoreSectionLength()),
+            centroidsInput,
+            entry.similarityFunction(),
+            preconditioner
+        );
+    }
+
+    /**
+     * The centroid file opened so that reads bypass the page cache, or {@code null} when the directory cannot do that. It
+     * serves the rescore records of fields that were asked to rescore from disk, the same option that makes the raw vectors
+     * be read with direct I/O. It is opened on first use and closed with this reader.
+     */
+    private IndexInput directRescoreInput() throws IOException {
+        final SegmentReadState readState = segmentReadState();
+        if (FsDirectoryFactory.isHybridFs(readState.directory) == false) {
+            return null;
+        }
+        IndexInput input = directRescoreInput;
+        if (input == null) {
+            synchronized (this) {
+                input = directRescoreInput;
+                if (input == null) {
+                    input = readState.directory.openInput(centroidFileName(), DirectIOContext.searchRead(readState.context.hints()));
+                    directRescoreInput = input;
+                }
+            }
+        }
+        return input;
+    }
+
+    @Override
+    public void close() throws IOException {
+        final IndexInput input = directRescoreInput;
+        directRescoreInput = null;
+        IOUtils.close(super::close, input);
     }
 
     private static IndexInput rawCentroidsSlice(IndexInput centroidSlice, int numCentroids, int dimension, int bytesPerComponent)

@@ -30,10 +30,12 @@ import java.util.Arrays;
  * grouped by cluster, repeated for overspilled vectors, and cannot be found by vector ordinal.
  * <p>
  * Layout: {@code rescoreBits, osqBits, dimension, numberOfVectors, numberOfCentroids, clusterIdBytes} as ints, the
- * codebook and the per dimension scales as float bits, then one fixed length record per ordinal. A record holds the lower
- * and upper OSQ interval and the squared norm of the reconstructed vector as float bits, the cluster id in
- * {@code clusterIdBytes} little endian bytes, the packed OSQ code and the packed residual code. The squared norm lets
- * Euclidean and cosine scores be computed from codebook sums without decoding the vector.
+ * codebook and the per dimension scales as float bits, one int per ordinal giving the slot of its record, then one fixed
+ * length record per slot. Slots are grouped by the primary cluster of the vectors, clusters in ascending order and ordinals
+ * ascending within a cluster, which is the order of the posting lists, so candidates that were found together are stored
+ * together. A record holds the lower and upper OSQ interval and the squared norm of the reconstructed vector as float bits,
+ * the cluster id in {@code clusterIdBytes} little endian bytes, the packed OSQ code and the packed residual code. The
+ * squared norm lets Euclidean and cosine scores be computed from codebook sums without decoding the vector.
  */
 final class QuantizedRescoreWriter {
 
@@ -96,6 +98,24 @@ final class QuantizedRescoreWriter {
             output.writeInt(Float.floatToIntBits(scale));
         }
 
+        final int[] ordinalToSlot = new int[numberOfVectors];
+        final int[] slotToOrdinal = new int[numberOfVectors];
+        final int[] nextSlotOfCluster = new int[numberOfCentroids + 1];
+        for (int ord = 0; ord < numberOfVectors; ord++) {
+            nextSlotOfCluster[assignments[ord] + 1]++;
+        }
+        for (int cluster = 0; cluster < numberOfCentroids; cluster++) {
+            nextSlotOfCluster[cluster + 1] += nextSlotOfCluster[cluster];
+        }
+        for (int ord = 0; ord < numberOfVectors; ord++) {
+            final int slot = nextSlotOfCluster[assignments[ord]]++;
+            ordinalToSlot[ord] = slot;
+            slotToOrdinal[slot] = ord;
+        }
+        for (int slot : ordinalToSlot) {
+            output.writeInt(slot);
+        }
+
         final int osqPackedLength = BitPacking.packedLength(dimension, osqBits);
         final int clusterIdOffset = QuantizedRescoreValues.HEADER_FLOATS * Float.BYTES;
         final int osqCodesOffset = clusterIdOffset + clusterIdBytes;
@@ -103,7 +123,8 @@ final class QuantizedRescoreWriter {
         final byte[] recordBytes = new byte[QuantizedRescoreValues.recordLength(dimension, osqBits, rescoreBits, clusterIdBytes)];
         final ByteBuffer recordBuffer = ByteBuffer.wrap(recordBytes).order(ByteOrder.LITTLE_ENDIAN);
         final int[] residualCodes = new int[dimension];
-        for (int ord = 0; ord < numberOfVectors; ord++) {
+        for (int slot = 0; slot < numberOfVectors; slot++) {
+            final int ord = slotToOrdinal[slot];
             final int cluster = assignments[ord];
             final float[] centroid = centroidSupplier.centroid(cluster);
             residualComputer.compute(floatVectors.vectorValue(ord), centroid);

@@ -1,12 +1,12 @@
 setup:
   - requires:
-      cluster_features: ["mapper.vectors.diskbbq_rescore_bits"]
-      reason: Needs rescore_bits support for bbq_disk
+      cluster_features: ["mapper.vectors.diskbbq_rescore_residuals"]
+      reason: Needs rescore_residuals support for bbq_disk
   - skip:
       features: "headers"
   - do:
       indices.create:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         body:
           settings:
             index:
@@ -21,11 +21,11 @@ setup:
                 similarity: l2_norm
                 index_options:
                   type: bbq_disk
-                  rescore_bits: 4
+                  rescore_residuals: true
 
   - do:
       index:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         id: "1"
         body:
           vector: [0.077,  0.32 , -0.205,  0.63 ,  0.032,  0.201,  0.167, -0.313,
@@ -38,11 +38,11 @@ setup:
                    -0.683,  1.331,  0.194, -0.157, -0.1  , -0.279, -0.098, -0.176]
   - do:
       indices.flush:
-        index: rescore_bits_test
+        index: rescore_residuals_test
 
   - do:
       index:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         id: "2"
         body:
           vector: [0.196,  0.514,  0.039,  0.555, -0.042,  0.242,  0.463, -0.348,
@@ -55,11 +55,11 @@ setup:
                    -0.489,  0.901,  0.208,  0.011, -0.209, -0.153, -0.27 , -0.013]
   - do:
       indices.flush:
-        index: rescore_bits_test
+        index: rescore_residuals_test
 
   - do:
       index:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         id: "3"
         body:
           vector: [-0.11 ,  0.377, -0.137,  0.623, -0.132,  0.113,  0.37 , -0.142,
@@ -72,29 +72,29 @@ setup:
                    -0.539,  1.019,  0.199, -0.036, -0.178, -0.186, -0.226, -0.051]
   - do:
       indices.flush:
-        index: rescore_bits_test
+        index: rescore_residuals_test
 
   - do:
       indices.forcemerge:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         max_num_segments: 1
 
   - do:
       indices.refresh: {}
 
 ---
-"rescore_bits is stored in the mapping":
+"rescore_residuals is stored in the mapping":
   - do:
       indices.get_mapping:
-        index: rescore_bits_test
+        index: rescore_residuals_test
 
-  - match: { rescore_bits_test.mappings.properties.vector.index_options.rescore_bits: 4 }
+  - match: { rescore_residuals_test.mappings.properties.vector.index_options.rescore_residuals: true }
 
 ---
 "search rescores with quantized codes by default and with raw vectors on request":
   - do:
       search:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         body:
           knn:
             field: vector
@@ -117,7 +117,7 @@ setup:
 
   - do:
       search:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         body:
           knn:
             field: vector
@@ -140,10 +140,36 @@ setup:
   - match: { hits.hits.0._id: "1" }
 
 ---
-"rescore_bits can be updated":
+"search reads the quantized codes in storage order on request":
+  - do:
+      search:
+        index: rescore_residuals_test
+        body:
+          knn:
+            field: vector
+            k: 3
+            num_candidates: 10
+            visit_percentage: 100
+            rescore_vector:
+              oversample: 2
+              sequential_read: true
+            query_vector: [0.077,  0.32 , -0.205,  0.63 ,  0.032,  0.201,  0.167, -0.313,
+                           0.176,  0.531, -0.375,  0.334, -0.046,  0.078, -0.349,  0.272,
+                           0.307, -0.083,  0.504,  0.255, -0.404,  0.289, -0.226, -0.132,
+                           -0.216,  0.49 ,  0.039,  0.507, -0.307,  0.107,  0.09 , -0.265,
+                           -0.285,  0.336, -0.272,  0.369, -0.282,  0.086, -0.132,  0.475,
+                           -0.224,  0.203,  0.439,  0.064,  0.246, -0.396,  0.297,  0.242,
+                           -0.028,  0.321, -0.022, -0.009, -0.001,  0.031, -0.533,  0.45,
+                           -0.683,  1.331,  0.194, -0.157, -0.1  , -0.279, -0.098, -0.176]
+
+  - match: { hits.total.value: 3 }
+  - match: { hits.hits.0._id: "1" }
+
+---
+"rescore_residuals can be updated":
   - do:
       indices.put_mapping:
-        index: rescore_bits_test
+        index: rescore_residuals_test
         body:
           properties:
             vector:
@@ -153,19 +179,19 @@ setup:
               similarity: l2_norm
               index_options:
                 type: bbq_disk
-                rescore_bits: 8
+                rescore_residuals: false
 
   - do:
       indices.get_mapping:
-        index: rescore_bits_test
+        index: rescore_residuals_test
 
-  - match: { rescore_bits_test.mappings.properties.vector.index_options.rescore_bits: 8 }
+  - is_false: rescore_residuals_test.mappings.properties.vector.index_options.rescore_residuals
 
 ---
-"rescore_bits works with preconditioning":
+"rescore_residuals works with preconditioning":
   - do:
       indices.create:
-        index: rescore_bits_precondition_test
+        index: rescore_residuals_precondition_test
         body:
           settings:
             index:
@@ -180,12 +206,12 @@ setup:
                 similarity: l2_norm
                 index_options:
                   type: bbq_disk
-                  rescore_bits: 4
+                  rescore_residuals: true
                   precondition: true
 
   - do:
       index:
-        index: rescore_bits_precondition_test
+        index: rescore_residuals_precondition_test
         id: "1"
         body:
           vector: [0.077,  0.32 , -0.205,  0.63 ,  0.032,  0.201,  0.167, -0.313,
@@ -199,7 +225,7 @@ setup:
 
   - do:
       index:
-        index: rescore_bits_precondition_test
+        index: rescore_residuals_precondition_test
         id: "2"
         body:
           vector: [0.196,  0.514,  0.039,  0.555, -0.042,  0.242,  0.463, -0.348,
@@ -213,7 +239,7 @@ setup:
 
   - do:
       indices.forcemerge:
-        index: rescore_bits_precondition_test
+        index: rescore_residuals_precondition_test
         max_num_segments: 1
 
   - do:
@@ -221,7 +247,7 @@ setup:
 
   - do:
       search:
-        index: rescore_bits_precondition_test
+        index: rescore_residuals_precondition_test
         body:
           knn:
             field: vector
@@ -230,6 +256,7 @@ setup:
             visit_percentage: 100
             rescore_vector:
               oversample: 2
+              sequential_read: true
             query_vector: [0.077,  0.32 , -0.205,  0.63 ,  0.032,  0.201,  0.167, -0.313,
                            0.176,  0.531, -0.375,  0.334, -0.046,  0.078, -0.349,  0.272,
                            0.307, -0.083,  0.504,  0.255, -0.404,  0.289, -0.226, -0.132,

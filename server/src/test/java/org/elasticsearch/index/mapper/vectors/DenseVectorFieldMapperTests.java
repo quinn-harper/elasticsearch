@@ -1191,17 +1191,19 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
         }
     }
 
-    public void testRescoreBitsIndexOption() throws IOException {
-        assumeTrue("rescore_bits requires a snapshot build", Build.current().isSnapshot());
+    public void testRescoreResidualsIndexOption() throws IOException {
+        assumeTrue("rescore_residuals requires a snapshot build", Build.current().isSnapshot());
 
-        for (int bits : new int[] { 1, 4, 8 }) {
-            MapperService mapperService = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(bits));
-            var indexOptions = getIndexOptions(mapperService, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class);
-            assertEquals(bits, indexOptions.getRescoreBits());
-            assertThat(mapperService.documentMapper().mappingSource().toString(), containsString("\"rescore_bits\":" + bits));
-        }
+        MapperService enabled = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreResidualsMapping(true));
+        var enabledOptions = getIndexOptions(enabled, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class);
+        assertTrue(enabledOptions.isRescoreResiduals());
+        assertThat(enabled.documentMapper().mappingSource().toString(), containsString("\"rescore_residuals\":true"));
 
-        MapperService withoutBits = createMapperService(
+        MapperService disabled = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreResidualsMapping(false));
+        assertFalse(getIndexOptions(disabled, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).isRescoreResiduals());
+        assertThat(disabled.documentMapper().mappingSource().toString(), not(containsString("rescore_residuals")));
+
+        MapperService withoutOption = createMapperService(
             EXPERIMENTAL_FEATURES_ENABLED,
             fieldMapping(
                 b -> new DenseVectorMappingBuilder().dims(128)
@@ -1211,32 +1213,24 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
                     .build(b)
             )
         );
-        assertEquals(0, getIndexOptions(withoutBits, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).getRescoreBits());
-        assertThat(withoutBits.documentMapper().mappingSource().toString(), not(containsString("rescore_bits")));
+        assertFalse(getIndexOptions(withoutOption, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).isRescoreResiduals());
+        assertThat(withoutOption.documentMapper().mappingSource().toString(), not(containsString("rescore_residuals")));
     }
 
-    public void testRescoreBitsIsRejectedWhenUnsupported() {
-        assumeTrue("rescore_bits requires a snapshot build", Build.current().isSnapshot());
-
-        for (int invalid : new int[] { 0, 9, -1 }) {
-            Exception e = expectThrows(
-                MapperParsingException.class,
-                () -> createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(invalid))
-            );
-            assertThat(e.getMessage(), containsString("[rescore_bits] must be between 1 and 8"));
-        }
+    public void testRescoreResidualsIsRejectedWhenUnsupported() {
+        assumeTrue("rescore_residuals requires a snapshot build", Build.current().isSnapshot());
 
         Exception ash = expectThrows(
             MapperParsingException.class,
-            () -> createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(4, Map.of("quantization_type", "ash")))
+            () -> createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreResidualsMapping(true, Map.of("quantization_type", "ash")))
         );
-        assertThat(ash.getMessage(), containsString("[rescore_bits] is not supported with quantization_type [ash]"));
+        assertThat(ash.getMessage(), containsString("[rescore_residuals] is not supported with quantization_type [ash]"));
 
         Exception notExperimental = expectThrows(
             MapperParsingException.class,
-            () -> createMapperService(EXPERIMENTAL_FEATURES_DISABLED, rescoreBitsMapping(4))
+            () -> createMapperService(EXPERIMENTAL_FEATURES_DISABLED, rescoreResidualsMapping(true))
         );
-        assertThat(notExperimental.getMessage(), containsString("[rescore_bits] requires the experimental dense vector features"));
+        assertThat(notExperimental.getMessage(), containsString("[rescore_residuals] requires the experimental dense vector features"));
 
         Exception notFloat = expectThrows(
             Exception.class,
@@ -1247,20 +1241,26 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
                         .index(true)
                         .similarity(VectorSimilarity.COSINE)
                         .elementType(ElementType.BYTE)
-                        .indexOptions(Map.of("type", "bbq_disk", "rescore_bits", 4))
+                        .indexOptions(Map.of("type", "bbq_disk", "rescore_residuals", true))
                         .build(b)
                 )
             )
         );
-        assertThat(notFloat.getMessage(), containsString("[rescore_bits] is only supported when [element_type] is [float] or [bfloat16]"));
+        assertThat(
+            notFloat.getMessage(),
+            containsString("[rescore_residuals] is only supported when [element_type] is [float] or [bfloat16]")
+        );
     }
 
-    public void testRescoreBitsIsAcceptedWithPreconditioningAndBFloat16() throws IOException {
-        assumeTrue("rescore_bits requires a snapshot build", Build.current().isSnapshot());
+    public void testRescoreResidualsIsAcceptedWithPreconditioningAndBFloat16() throws IOException {
+        assumeTrue("rescore_residuals requires a snapshot build", Build.current().isSnapshot());
 
-        MapperService preconditioned = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(4, Map.of("precondition", true)));
+        MapperService preconditioned = createMapperService(
+            EXPERIMENTAL_FEATURES_ENABLED,
+            rescoreResidualsMapping(true, Map.of("precondition", true))
+        );
         var preconditionedOptions = getIndexOptions(preconditioned, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class);
-        assertEquals(4, preconditionedOptions.getRescoreBits());
+        assertTrue(preconditionedOptions.isRescoreResiduals());
         assertTrue(preconditionedOptions.doPrecondition());
 
         MapperService bfloat16 = createMapperService(
@@ -1270,29 +1270,30 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
                     .index(true)
                     .similarity(VectorSimilarity.COSINE)
                     .elementType(ElementType.BFLOAT16)
-                    .indexOptions(Map.of("type", "bbq_disk", "rescore_bits", 4))
+                    .indexOptions(Map.of("type", "bbq_disk", "rescore_residuals", true))
                     .build(b)
             )
         );
-        assertEquals(4, getIndexOptions(bfloat16, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).getRescoreBits());
+        assertTrue(getIndexOptions(bfloat16, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).isRescoreResiduals());
     }
 
-    public void testRescoreBitsCanBeChangedByMappingUpdate() throws IOException {
-        assumeTrue("rescore_bits requires a snapshot build", Build.current().isSnapshot());
+    public void testRescoreResidualsCanBeChangedByMappingUpdate() throws IOException {
+        assumeTrue("rescore_residuals requires a snapshot build", Build.current().isSnapshot());
 
-        MapperService mapperService = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreBitsMapping(2));
-        merge(mapperService, rescoreBitsMapping(6));
-        assertEquals(6, getIndexOptions(mapperService, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).getRescoreBits());
+        MapperService mapperService = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, rescoreResidualsMapping(false));
+        merge(mapperService, rescoreResidualsMapping(true));
+        assertTrue(getIndexOptions(mapperService, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).isRescoreResiduals());
     }
 
-    private static XContentBuilder rescoreBitsMapping(int rescoreBits) throws IOException {
-        return rescoreBitsMapping(rescoreBits, Map.of());
+    private static XContentBuilder rescoreResidualsMapping(boolean rescoreResiduals) throws IOException {
+        return rescoreResidualsMapping(rescoreResiduals, Map.of());
     }
 
-    private static XContentBuilder rescoreBitsMapping(int rescoreBits, Map<String, Object> extraIndexOptions) throws IOException {
+    private static XContentBuilder rescoreResidualsMapping(boolean rescoreResiduals, Map<String, Object> extraIndexOptions)
+        throws IOException {
         Map<String, Object> indexOptions = new HashMap<>(extraIndexOptions);
         indexOptions.put("type", "bbq_disk");
-        indexOptions.put("rescore_bits", rescoreBits);
+        indexOptions.put("rescore_residuals", rescoreResiduals);
         return fieldMapping(
             b -> new DenseVectorMappingBuilder().dims(128)
                 .index(true)

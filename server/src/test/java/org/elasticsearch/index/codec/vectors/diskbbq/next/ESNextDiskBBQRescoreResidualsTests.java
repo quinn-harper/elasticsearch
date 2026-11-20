@@ -38,6 +38,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.CentroidIndexFormat;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
+import org.elasticsearch.index.codec.vectors.diskbbq.OrderedRescoreVectorValues;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
@@ -45,6 +46,7 @@ import org.elasticsearch.search.vectors.RescoreKnnVectorQuery;
 import org.elasticsearch.test.ESTestCase;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Optional;
 import java.util.Set;
@@ -54,27 +56,29 @@ import static org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVe
 import static org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat.defaultFlatThreshold;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 
 /**
- * Checks that segments written with {@code rescoreBits} store residual codes that reproduce the raw vector scores
- * closely, that the accuracy depends on the number of bits, and that the codes survive merges.
+ * Checks that segments written with quantized rescoring store eight bit residual codes that reproduce the raw vector scores
+ * closely, that the codes survive merges, and that reading them in storage order gives the same scores as reading them one
+ * candidate at a time.
  */
-public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
+public class ESNextDiskBBQRescoreResidualsTests extends ESTestCase {
 
     private static final String VECTOR_FIELD = "vector";
     private static final String MATCH_FIELD = "match";
     private static final int DIMENSIONS = 64;
     private static final int VECTORS_PER_CLUSTER = 128;
 
-    private static Codec codec(int rescoreBits) {
-        return codec(rescoreBits, false, DenseVectorFieldMapper.ElementType.FLOAT, IvfFlushConfigSource.empty());
+    private static Codec codec(boolean quantizedRescore) {
+        return codec(quantizedRescore, false, DenseVectorFieldMapper.ElementType.FLOAT, IvfFlushConfigSource.empty());
     }
 
     private static Codec codec(
-        int rescoreBits,
+        boolean quantizedRescore,
         boolean doPrecondition,
         DenseVectorFieldMapper.ElementType elementType,
         IvfFlushConfigSource flushConfigSource
@@ -95,7 +99,7 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
                 flushConfigSource,
                 IvfMergeConfigResolver.useCodecDefault(),
                 false,
-                rescoreBits
+                quantizedRescore
             )
         );
     }
@@ -133,7 +137,6 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         return (QuantizedRescoringReader) fieldReader;
     }
 
-    /** The mean absolute difference between the quantized score and the exact score over every vector of the segment. */
     private static double meanScoreError(LeafReader leafReader, VectorSimilarityFunction similarity, float[] query) throws IOException {
         return meanScoreError(leafReader, similarity, query, false);
     }
@@ -161,15 +164,6 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         return totalError / scored;
     }
 
-    private static double meanScoreErrorAfterIndexing(int rescoreBits, VectorSimilarityFunction similarity, int numberOfVectors)
-        throws IOException {
-        return meanScoreErrorAfterIndexing(
-            codec(rescoreBits),
-            similarity,
-            numberOfVectors
-        );
-    }
-
     private static double meanScoreErrorAfterIndexing(Codec codec, VectorSimilarityFunction similarity, int numberOfVectors)
         throws IOException {
         try (Directory directory = newDirectory()) {
@@ -186,17 +180,10 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         }
     }
 
-    public void testQuantizedScoresAreMoreAccurateWithMoreBits() throws IOException {
+    public void testQuantizedScoresAreNearlyExact() throws IOException {
         final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
-        final int numberOfVectors = randomIntBetween(600, 1_200);
-
-        final double oneBitError = meanScoreErrorAfterIndexing(1, similarity, numberOfVectors);
-        final double fourBitError = meanScoreErrorAfterIndexing(4, similarity, numberOfVectors);
-        final double eightBitError = meanScoreErrorAfterIndexing(8, similarity, numberOfVectors);
-
-        assertThat(fourBitError, lessThan(oneBitError));
-        assertThat(eightBitError, lessThan(fourBitError));
-        assertThat("eight bits should be nearly exact", eightBitError, lessThan(5e-3));
+        final double error = meanScoreErrorAfterIndexing(codec(true), similarity, randomIntBetween(600, 1_200));
+        assertThat("eight bits should be nearly exact", error, lessThan(5e-3));
     }
 
     public void testLookupScoresMatchScoringTheDecodedVector() throws IOException {
@@ -206,7 +193,7 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
             VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
         );
         try (Directory directory = newDirectory()) {
-            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(randomIntBetween(1, 8)));
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 addVectors(writer, randomIntBetween(600, 1_200), similarity);
                 writer.forceMerge(1);
@@ -231,43 +218,30 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
 
     public void testResidualCodesImproveOnTheFirstLevelEstimate() throws IOException {
         final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
-        final int numberOfVectors = randomIntBetween(600, 1_200);
-        for (int rescoreBits : new int[] { 2, 6 }) {
-            try (Directory directory = newDirectory()) {
-                final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(rescoreBits));
-                try (IndexWriter writer = new IndexWriter(directory, config)) {
-                    addVectors(writer, numberOfVectors, similarity);
-                    writer.forceMerge(1);
-                }
-                try (DirectoryReader reader = DirectoryReader.open(directory)) {
-                    final LeafReader leaf = reader.leaves().get(0).reader();
-                    final float[] query = randomUnitVector();
-                    final double firstLevelError = meanScoreError(leaf, similarity, query, true);
-                    final double twoLevelError = meanScoreError(leaf, similarity, query, false);
-                    assertThat("rescoreBits=" + rescoreBits, twoLevelError, lessThan(firstLevelError));
-                }
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                addVectors(writer, randomIntBetween(600, 1_200), similarity);
+                writer.forceMerge(1);
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                final LeafReader leaf = reader.leaves().get(0).reader();
+                final float[] query = randomUnitVector();
+                final double firstLevelError = meanScoreError(leaf, similarity, query, true);
+                final double twoLevelError = meanScoreError(leaf, similarity, query, false);
+                assertThat(twoLevelError, lessThan(firstLevelError));
             }
         }
     }
 
     public void testPreconditionedSegmentsAreScoredInTheRotatedSpace() throws IOException {
         final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
-        final int numberOfVectors = randomIntBetween(600, 1_200);
-        final DenseVectorFieldMapper.ElementType elementType = DenseVectorFieldMapper.ElementType.FLOAT;
-
-        final double oneBitError = meanScoreErrorAfterIndexing(
-            codec(1, true, elementType, IvfFlushConfigSource.empty()),
+        final double error = meanScoreErrorAfterIndexing(
+            codec(true, true, DenseVectorFieldMapper.ElementType.FLOAT, IvfFlushConfigSource.empty()),
             similarity,
-            numberOfVectors
+            randomIntBetween(600, 1_200)
         );
-        final double eightBitError = meanScoreErrorAfterIndexing(
-            codec(8, true, elementType, IvfFlushConfigSource.empty()),
-            similarity,
-            numberOfVectors
-        );
-
-        assertThat(eightBitError, lessThan(oneBitError));
-        assertThat("eight bits should be nearly exact once the query is rotated like the vectors", eightBitError, lessThan(5e-3));
+        assertThat("eight bits should be nearly exact once the query is rotated like the vectors", error, lessThan(5e-3));
     }
 
     public void testSegmentsWithAndWithoutPreconditioningAreBothScoredCorrectly() throws IOException {
@@ -283,7 +257,7 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         );
         try (Directory directory = newDirectory()) {
             final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(
-                codec(8, false, DenseVectorFieldMapper.ElementType.FLOAT, alternatingPreconditioning)
+                codec(true, false, DenseVectorFieldMapper.ElementType.FLOAT, alternatingPreconditioning)
             );
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 for (int segment = 0; segment < 4; segment++) {
@@ -302,9 +276,8 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
 
     public void testBFloat16VectorsScoreCloseToTheRoundedRawVectors() throws IOException {
         final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
-        final boolean doPrecondition = randomBoolean();
         final double error = meanScoreErrorAfterIndexing(
-            codec(8, doPrecondition, DenseVectorFieldMapper.ElementType.BFLOAT16, IvfFlushConfigSource.empty()),
+            codec(true, randomBoolean(), DenseVectorFieldMapper.ElementType.BFLOAT16, IvfFlushConfigSource.empty()),
             similarity,
             randomIntBetween(600, 1_200)
         );
@@ -314,7 +287,7 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
     public void testSectionIsRebuiltWhenSegmentsAreMerged() throws IOException {
         final VectorSimilarityFunction similarity = VectorSimilarityFunction.EUCLIDEAN;
         try (Directory directory = newDirectory()) {
-            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(8));
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 for (int segment = 0; segment < 3; segment++) {
                     addVectors(writer, randomIntBetween(400, 700), similarity);
@@ -335,9 +308,9 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         }
     }
 
-    public void testNoQuantizedValuesWhenRescoreBitsIsZero() throws IOException {
+    public void testNoQuantizedValuesWhenQuantizedRescoreIsOff() throws IOException {
         try (Directory directory = newDirectory()) {
-            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(0));
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(false));
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 addVectors(writer, 500, VectorSimilarityFunction.EUCLIDEAN);
             }
@@ -351,7 +324,7 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
 
     public void testQuantizedValuesKeepRawOrdinalsAndDocIds() throws IOException {
         try (Directory directory = newDirectory()) {
-            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(4));
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 for (int i = 0; i < 600; i++) {
                     final Document document = new Document();
@@ -376,11 +349,76 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         }
     }
 
+    public void testScoreOrdinalsMatchesScoringEachOrdinalOnItsOwn() throws IOException {
+        final VectorSimilarityFunction similarity = randomFrom(
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorSimilarityFunction.DOT_PRODUCT,
+            VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+        );
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(
+                codec(true, randomBoolean(), DenseVectorFieldMapper.ElementType.FLOAT, IvfFlushConfigSource.empty())
+            );
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                addVectors(writer, randomIntBetween(600, 1_200), similarity);
+                writer.forceMerge(1);
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                final LeafReader leaf = reader.leaves().get(0).reader();
+                final FloatVectorValues quantized = quantizedReader(leaf).getQuantizedRescoreValues(VECTOR_FIELD);
+                assertThat(quantized, instanceOf(OrderedRescoreVectorValues.class));
+                final OrderedRescoreVectorValues ordered = (OrderedRescoreVectorValues) quantized;
+                final float[] query = randomUnitVector();
+
+                final int count = randomIntBetween(1, 200);
+                final int[] ordinals = new int[count];
+                for (int i = 0; i < count; i++) {
+                    ordinals[i] = randomIntBetween(0, quantized.size() - 1);
+                }
+                final float[] scores = new float[count + randomIntBetween(0, 3)];
+                ordered.scoreOrdinals(query, ordinals, count, scores);
+
+                for (int i = 0; i < count; i++) {
+                    final VectorScorer scorer = quantized.rescorer(query);
+                    final int doc = quantized.ordToDoc(ordinals[i]);
+                    assertThat(scorer.iterator().advance(doc), equalTo(doc));
+                    assertEquals("position " + i + " ordinal " + ordinals[i], scorer.score(), scores[i], 1e-6f);
+                }
+            }
+        }
+    }
+
+    public void testScoreOrdinalsOfASingleOrdinalAndOfEveryOrdinal() throws IOException {
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                addVectors(writer, 700, VectorSimilarityFunction.EUCLIDEAN);
+                writer.forceMerge(1);
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                final LeafReader leaf = reader.leaves().get(0).reader();
+                final FloatVectorValues quantized = quantizedReader(leaf).getQuantizedRescoreValues(VECTOR_FIELD);
+                final OrderedRescoreVectorValues ordered = (OrderedRescoreVectorValues) quantized;
+                final float[] query = randomUnitVector();
+
+                final int[] everyOrdinal = new int[quantized.size()];
+                Arrays.setAll(everyOrdinal, i -> i);
+                final float[] allScores = new float[everyOrdinal.length];
+                ordered.scoreOrdinals(query, everyOrdinal, everyOrdinal.length, allScores);
+
+                final int ordinal = randomIntBetween(0, quantized.size() - 1);
+                final float[] singleScore = new float[1];
+                ordered.scoreOrdinals(query, new int[] { ordinal }, 1, singleScore);
+                assertEquals(allScores[ordinal], singleScore[0], 1e-6f);
+            }
+        }
+    }
+
     public void testRescoreQueryUsesQuantizedCodesUnlessOptedOut() throws IOException {
         final VectorSimilarityFunction similarity = VectorSimilarityFunction.EUCLIDEAN;
         final int k = 10;
         try (Directory directory = newDirectory()) {
-            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(8));
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
             try (IndexWriter writer = new IndexWriter(directory, config)) {
                 addVectors(writer, 800, similarity);
                 writer.forceMerge(1);
@@ -419,17 +457,86 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
         }
     }
 
-    public void testFormatRejectsUnsupportedRescoreBitsCombinations() {
-        expectThrows(IllegalArgumentException.class, () -> formatWith(9, false, DenseVectorFieldMapper.ElementType.FLOAT));
-        expectThrows(IllegalArgumentException.class, () -> formatWith(-1, false, DenseVectorFieldMapper.ElementType.FLOAT));
-        expectThrows(IllegalArgumentException.class, () -> formatWith(4, false, DenseVectorFieldMapper.ElementType.BYTE));
-        formatWith(4, true, DenseVectorFieldMapper.ElementType.FLOAT);
-        formatWith(4, false, DenseVectorFieldMapper.ElementType.BFLOAT16);
-        formatWith(4, true, DenseVectorFieldMapper.ElementType.BFLOAT16);
+    public void testSequentialRescoreReadGivesTheSameResultsAsReadingOneCandidateAtATime() throws IOException {
+        final VectorSimilarityFunction similarity = randomFrom(VectorSimilarityFunction.EUCLIDEAN, VectorSimilarityFunction.DOT_PRODUCT);
+        final int k = 10;
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(true));
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                for (int segment = 0; segment < 3; segment++) {
+                    addVectors(writer, randomIntBetween(400, 700), similarity);
+                    writer.commit();
+                }
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                assertThat(reader.leaves().size(), greaterThanOrEqualTo(2));
+                for (LeafReaderContext leaf : reader.leaves()) {
+                    assertThat(quantizedReader(leaf.reader()).getQuantizedRescoreValues(VECTOR_FIELD), notNullValue());
+                }
+                final IndexSearcher searcher = new IndexSearcher(reader);
+                final float[] query = randomUnitVector();
+                final TermQuery everything = new TermQuery(new Term(MATCH_FIELD, "all"));
+                final int rescoreK = reader.maxDoc();
+
+                final ScoreDoc[] oneAtATime = searcher.search(
+                    RescoreKnnVectorQuery.fromInnerQuery(VECTOR_FIELD, query, k, rescoreK, everything, true, false),
+                    k
+                ).scoreDocs;
+                final ScoreDoc[] sequential = searcher.search(
+                    RescoreKnnVectorQuery.fromInnerQuery(VECTOR_FIELD, query, k, rescoreK, everything, true, true),
+                    k
+                ).scoreDocs;
+
+                assertThat(sequential.length, equalTo(oneAtATime.length));
+                for (int i = 0; i < k; i++) {
+                    assertThat(sequential[i].doc, equalTo(oneAtATime[i].doc));
+                    assertEquals(oneAtATime[i].score, sequential[i].score, 1e-6f);
+                }
+            }
+        }
+    }
+
+    public void testSequentialRescoreReadIsIgnoredForRawVectors() throws IOException {
+        final int k = 10;
+        try (Directory directory = newDirectory()) {
+            final IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer()).setCodec(codec(false));
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                addVectors(writer, 600, VectorSimilarityFunction.EUCLIDEAN);
+                writer.forceMerge(1);
+            }
+            try (DirectoryReader reader = DirectoryReader.open(directory)) {
+                final IndexSearcher searcher = new IndexSearcher(reader);
+                final float[] query = randomUnitVector();
+                final TermQuery everything = new TermQuery(new Term(MATCH_FIELD, "all"));
+
+                final ScoreDoc[] withoutFlag = searcher.search(
+                    RescoreKnnVectorQuery.fromInnerQuery(VECTOR_FIELD, query, k, 600, everything, true, false),
+                    k
+                ).scoreDocs;
+                final ScoreDoc[] withFlag = searcher.search(
+                    RescoreKnnVectorQuery.fromInnerQuery(VECTOR_FIELD, query, k, 600, everything, true, true),
+                    k
+                ).scoreDocs;
+
+                assertThat(withFlag.length, equalTo(withoutFlag.length));
+                for (int i = 0; i < k; i++) {
+                    assertThat(withFlag[i].doc, equalTo(withoutFlag[i].doc));
+                    assertEquals(withoutFlag[i].score, withFlag[i].score, 0f);
+                }
+            }
+        }
+    }
+
+    public void testFormatRejectsUnsupportedQuantizedRescoreCombinations() {
+        expectThrows(IllegalArgumentException.class, () -> formatWith(true, false, DenseVectorFieldMapper.ElementType.BYTE));
+        formatWith(false, false, DenseVectorFieldMapper.ElementType.BYTE);
+        formatWith(true, true, DenseVectorFieldMapper.ElementType.FLOAT);
+        formatWith(true, false, DenseVectorFieldMapper.ElementType.BFLOAT16);
+        formatWith(true, true, DenseVectorFieldMapper.ElementType.BFLOAT16);
     }
 
     private static ESNextDiskBBQVectorsFormat formatWith(
-        int rescoreBits,
+        boolean quantizedRescore,
         boolean doPrecondition,
         DenseVectorFieldMapper.ElementType elementType
     ) {
@@ -448,7 +555,7 @@ public class ESNextDiskBBQRescoreBitsTests extends ESTestCase {
             IvfFlushConfigSource.empty(),
             IvfMergeConfigResolver.useCodecDefault(),
             false,
-            rescoreBits
+            quantizedRescore
         );
     }
 }

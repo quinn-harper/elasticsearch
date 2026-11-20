@@ -31,7 +31,8 @@ public record SearchParameters(
     long seed,
     boolean exact,
     boolean exactQuantized,
-    boolean quantizedRescore
+    boolean quantizedRescore,
+    boolean sequentialRescoreRead
 ) {
 
     static final ObjectParser<SearchParameters.Builder, Void> PARSER = new ObjectParser<>(
@@ -55,6 +56,7 @@ public record SearchParameters(
         PARSER.declareBoolean(Builder::setExact, TestConfiguration.EXACT_FIELD);
         PARSER.declareBoolean(Builder::setExactQuantized, TestConfiguration.EXACT_QUANTIZED_FIELD);
         PARSER.declareBoolean(Builder::setQuantizedRescore, TestConfiguration.QUANTIZED_RESCORE_FIELD);
+        PARSER.declareBoolean(Builder::setSequentialRescoreRead, TestConfiguration.SEQUENTIAL_RESCORE_READ_FIELD);
     }
 
     static SearchParameters.Builder fromXContent(XContentParser parser) {
@@ -80,6 +82,7 @@ public record SearchParameters(
         private Boolean exact;
         private Boolean exactQuantized;
         private Boolean quantizedRescore;
+        private Boolean sequentialRescoreRead;
 
         public Builder setNumCandidates(int numCandidates) {
             this.numCandidates = numCandidates;
@@ -151,6 +154,11 @@ public record SearchParameters(
             return this;
         }
 
+        public Builder setSequentialRescoreRead(boolean sequentialRescoreRead) {
+            this.sequentialRescoreRead = sequentialRescoreRead;
+            return this;
+        }
+
         private Builder setNullValues(SearchParameters params) {
             // Only set the null members, don't overwrite the set values
             this.numCandidates = Optional.ofNullable(numCandidates).orElse(params.numCandidates());
@@ -167,6 +175,7 @@ public record SearchParameters(
             this.exact = Optional.ofNullable(exact).orElse(params.exact());
             this.exactQuantized = Optional.ofNullable(exactQuantized).orElse(params.exactQuantized());
             this.quantizedRescore = Optional.ofNullable(quantizedRescore).orElse(params.quantizedRescore());
+            this.sequentialRescoreRead = Optional.ofNullable(sequentialRescoreRead).orElse(params.sequentialRescoreRead());
             return this;
         }
 
@@ -198,7 +207,8 @@ public record SearchParameters(
                 seed,
                 exact,
                 exactQuantized,
-                quantizedRescore
+                quantizedRescore,
+                sequentialRescoreRead
             );
         }
 
@@ -246,6 +256,9 @@ public record SearchParameters(
             }
             if (quantizedRescore != null) {
                 builder.field(TestConfiguration.QUANTIZED_RESCORE_FIELD.getPreferredName(), quantizedRescore);
+            }
+            if (sequentialRescoreRead != null) {
+                builder.field(TestConfiguration.SEQUENTIAL_RESCORE_READ_FIELD.getPreferredName(), sequentialRescoreRead);
             }
             return builder.endObject();
         }

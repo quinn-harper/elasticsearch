@@ -67,9 +67,50 @@ public class RescoreVectorBuilderTests extends ESTestCase {
     public void testNodesThatDoNotKnowQuantizedNeverSeeIt() throws IOException {
         assumeTrue("quantized is only accepted on snapshot builds", Build.current().isSnapshot());
         TransportVersion older = TransportVersionUtils.randomVersionNotSupporting(RescoreVectorBuilder.RESCORE_VECTOR_QUANTIZED);
-        RescoreVectorBuilder original = new RescoreVectorBuilder(2f, false);
+        RescoreVectorBuilder original = new RescoreVectorBuilder(2f, false, true);
         RescoreVectorBuilder copy = copyWriteable(original, writableRegistry(), RescoreVectorBuilder::new, older);
         assertThat(copy.oversample(), equalTo(2f));
         assertThat(copy.quantized(), nullValue());
+        assertThat(copy.sequentialRead(), nullValue());
+    }
+
+    public void testParseSequentialRead() throws IOException {
+        assumeTrue("sequential_read is only accepted on snapshot builds", Build.current().isSnapshot());
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, "{\"oversample\": 3, \"sequential_read\": true}")) {
+            RescoreVectorBuilder builder = RescoreVectorBuilder.fromXContent(parser);
+            assertThat(builder.oversample(), equalTo(3f));
+            assertThat(builder.sequentialRead(), equalTo(true));
+            assertThat(builder.quantized(), nullValue());
+        }
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, "{\"oversample\": 3}")) {
+            assertThat(RescoreVectorBuilder.fromXContent(parser).sequentialRead(), nullValue());
+        }
+    }
+
+    public void testSequentialReadIsWrittenBackToXContent() throws IOException {
+        assumeTrue("sequential_read is only accepted on snapshot builds", Build.current().isSnapshot());
+        assertThat(Strings.toString(new RescoreVectorBuilder(2f, null, true)), containsString("\"sequential_read\":true"));
+        assertThat(Strings.toString(new RescoreVectorBuilder(2f)), not(containsString("sequential_read")));
+    }
+
+    public void testSerializationRoundTripKeepsSequentialRead() throws IOException {
+        assumeTrue("sequential_read is only accepted on snapshot builds", Build.current().isSnapshot());
+        for (Boolean sequentialRead : new Boolean[] { null, true, false }) {
+            RescoreVectorBuilder original = new RescoreVectorBuilder(randomFrom(0f, 1f, 4.5f), randomFrom(null, true, false), sequentialRead);
+            RescoreVectorBuilder copy = copyWriteable(
+                original,
+                writableRegistry(),
+                RescoreVectorBuilder::new,
+                TransportVersion.current()
+            );
+            assertThat(copy, equalTo(original));
+            assertThat(copy.sequentialRead(), equalTo(sequentialRead));
+        }
+    }
+
+    public void testSequentialReadChangesEquality() {
+        assumeTrue("sequential_read is only accepted on snapshot builds", Build.current().isSnapshot());
+        assertThat(new RescoreVectorBuilder(2f, null, true).equals(new RescoreVectorBuilder(2f, null, false)), equalTo(false));
+        assertThat(new RescoreVectorBuilder(2f, null, true), equalTo(new RescoreVectorBuilder(2f, null, true)));
     }
 }

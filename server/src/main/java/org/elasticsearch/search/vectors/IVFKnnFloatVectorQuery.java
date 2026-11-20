@@ -222,7 +222,8 @@ public class IVFKnnFloatVectorQuery extends AbstractIVFKnnVectorQuery {
             finalK,
             rescoreK,
             approxTopN,
-            ivfQueryConfigResolver.useQuantizedRescore()
+            ivfQueryConfigResolver.useQuantizedRescore(),
+            ivfQueryConfigResolver.sequentialRescoreRead()
         );
     }
 }

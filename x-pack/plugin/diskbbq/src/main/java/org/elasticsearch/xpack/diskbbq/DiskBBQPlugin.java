@@ -133,7 +133,7 @@ public class DiskBBQPlugin extends Plugin implements InternalVectorFormatProvide
                             IvfFlushConfigSource.empty(),
                             mergeConfigResolver,
                             onDiskMerge,
-                            diskbbq.getRescoreBits()
+                            diskbbq.isRescoreResiduals()
                         );
                     } else if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE)) {
                         IvfMergeConfigResolver mergeConfigResolver = diskbbq.autoCalibrate()

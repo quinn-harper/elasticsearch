@@ -619,6 +619,14 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         return KnnVectorsReader.mergeOffHeapByteSizeMaps(raw, centroidsClusters);
     }
 
+    protected final SegmentReadState segmentReadState() {
+        return state;
+    }
+
+    protected final String centroidFileName() {
+        return IndexFileNames.segmentFileName(state.segmentInfo.name, state.segmentSuffix, centroidExtension);
+    }
+
     @Override
     public void close() throws IOException {
         List<Closeable> closeables = new ArrayList<>(genericReaders.allReaders());

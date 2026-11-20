@@ -19,11 +19,13 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.core.Nullable;
+import org.elasticsearch.index.codec.vectors.diskbbq.OrderedRescoreVectorValues;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 
 /**
  * Vector values whose scorers estimate similarity from the quantized rescoring section instead of the raw vectors.
@@ -41,12 +43,14 @@ import java.nio.ByteOrder;
  * dot products and Euclidean distances, so the score still approximates the similarity to the original vector.
  * {@link #vectorValue} returns the estimate in that clustering space and is not the original vector for such segments.
  */
-final class QuantizedRescoreValues extends FloatVectorValues {
+final class QuantizedRescoreValues extends FloatVectorValues implements OrderedRescoreVectorValues {
 
     static final int HEADER_FLOATS = 3;
 
     private final FloatVectorValues rawValues;
     private final IndexInput sectionInput;
+    private final IndexInput recordsSourceInput;
+    private final boolean directRecords;
     private final IndexInput centroidsInput;
     private final VectorSimilarityFunction similarityFunction;
     private final Preconditioner preconditioner;
@@ -58,6 +62,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
     private final int clusterIdBytes;
     private final float[] codebook;
     private final float[] dimensionScales;
+    private final long mapOffset;
     private final long recordsOffset;
     private final int recordLength;
 
@@ -82,13 +87,16 @@ final class QuantizedRescoreValues extends FloatVectorValues {
      * Opens the section written by {@link QuantizedRescoreWriter}.
      *
      * @param rawValues the raw vectors of the same field and segment, used for ordinals and doc ids
-     * @param sectionInput an input over exactly the section, positioned anywhere
+     * @param sectionInput an input over exactly the section, positioned anywhere, used for the header and the ordinal to slot map
+     * @param directRecordsInput an input over exactly the same section that bypasses the page cache, used to read the records,
+     *                           or {@code null} to read the records from {@code sectionInput}
      * @param centroidsInput an input over exactly the raw float centroids of the segment, one little endian float per dimension each
      * @param preconditioner the segment's preconditioner when its vectors were rotated before quantization, otherwise {@code null}
      */
     static QuantizedRescoreValues open(
         FloatVectorValues rawValues,
         IndexInput sectionInput,
+        @Nullable IndexInput directRecordsInput,
         IndexInput centroidsInput,
         VectorSimilarityFunction similarityFunction,
         @Nullable Preconditioner preconditioner
@@ -115,6 +123,19 @@ final class QuantizedRescoreValues extends FloatVectorValues {
                     + rawValues.size() + "] of dimension [" + rawValues.dimension() + "]"
             );
         }
+        final long mapOffset = header.getFilePointer();
+        final long expectedSectionLength = mapOffset + (long) numberOfVectors * Integer.BYTES + (long) numberOfVectors * recordLength(
+            dimension,
+            osqBits,
+            rescoreBits,
+            clusterIdBytes
+        );
+        if (sectionInput.length() != expectedSectionLength
+            || (directRecordsInput != null && directRecordsInput.length() != expectedSectionLength)) {
+            throw new IOException(
+                "quantized rescore section has [" + sectionInput.length() + "] bytes but [" + expectedSectionLength + "] were expected"
+            );
+        }
         final long expectedCentroidsLength = (long) numberOfCentroids * dimension * Float.BYTES;
         if (centroidsInput.length() != expectedCentroidsLength || clusterIdBytes != clusterIdBytes(numberOfCentroids)) {
             throw new IOException(
@@ -125,6 +146,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         return new QuantizedRescoreValues(
             rawValues,
             sectionInput,
+            directRecordsInput,
             centroidsInput,
             similarityFunction,
             preconditioner,
@@ -136,13 +158,14 @@ final class QuantizedRescoreValues extends FloatVectorValues {
             clusterIdBytes,
             codebook,
             dimensionScales,
-            header.getFilePointer()
+            mapOffset
         );
     }
 
     private QuantizedRescoreValues(
         FloatVectorValues rawValues,
         IndexInput sectionInput,
+        @Nullable IndexInput directRecordsInput,
         IndexInput centroidsInput,
         VectorSimilarityFunction similarityFunction,
         @Nullable Preconditioner preconditioner,
@@ -154,10 +177,12 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         int clusterIdBytes,
         float[] codebook,
         float[] dimensionScales,
-        long recordsOffset
+        long mapOffset
     ) {
         this.rawValues = rawValues;
         this.sectionInput = sectionInput;
+        this.recordsSourceInput = directRecordsInput != null ? directRecordsInput : sectionInput;
+        this.directRecords = directRecordsInput != null;
         this.centroidsInput = centroidsInput;
         this.similarityFunction = similarityFunction;
         this.preconditioner = preconditioner;
@@ -169,7 +194,8 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         this.clusterIdBytes = clusterIdBytes;
         this.codebook = codebook;
         this.dimensionScales = dimensionScales;
-        this.recordsOffset = recordsOffset;
+        this.mapOffset = mapOffset;
+        this.recordsOffset = mapOffset + (long) numberOfVectors * Integer.BYTES;
         this.recordLength = recordLength(dimension, osqBits, rescoreBits, clusterIdBytes);
     }
 
@@ -211,6 +237,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         return new QuantizedRescoreValues(
             rawValues.copy(),
             sectionInput.clone(),
+            directRecords ? recordsSourceInput.clone() : null,
             centroidsInput.clone(),
             similarityFunction,
             preconditioner,
@@ -222,8 +249,13 @@ final class QuantizedRescoreValues extends FloatVectorValues {
             clusterIdBytes,
             codebook,
             dimensionScales,
-            recordsOffset
+            mapOffset
         );
+    }
+
+    @Override
+    public void scoreOrdinals(float[] target, int[] ordinals, int count, float[] scoresOut) throws IOException {
+        new LookupScorer(target, true).scoreOrdinals(ordinals, count, scoresOut);
     }
 
     @Override
@@ -250,7 +282,8 @@ final class QuantizedRescoreValues extends FloatVectorValues {
      * from two threads.
      */
     private final class RecordReader {
-        private final IndexInput recordsInput = sectionInput.clone();
+        private final IndexInput recordsInput = recordsSourceInput.clone();
+        private final IndexInput slotsInput = sectionInput.clone();
         private final IndexInput centroids = centroidsInput.clone();
         private final byte[] recordBytes = new byte[recordLength];
         private final ByteBuffer recordBuffer = ByteBuffer.wrap(recordBytes).order(ByteOrder.LITTLE_ENDIAN);
@@ -264,8 +297,25 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         float squaredNorm;
         int cluster;
 
+        int slotOf(int ord) throws IOException {
+            slotsInput.seek(mapOffset + (long) ord * Integer.BYTES);
+            final int slot = slotsInput.readInt();
+            if (slot < 0 || slot >= numberOfVectors) {
+                throw new IOException("quantized rescore ordinal [" + ord + "] maps to slot [" + slot + "] of [" + numberOfVectors + "]");
+            }
+            return slot;
+        }
+
+        void prefetchSlots(int firstSlot, int slotCount) throws IOException {
+            recordsInput.prefetch(recordsOffset + (long) firstSlot * recordLength, (long) slotCount * recordLength);
+        }
+
         void read(int ord, boolean includeResidualCodes) throws IOException {
-            recordsInput.seek(recordsOffset + (long) ord * recordLength);
+            readSlot(slotOf(ord), includeResidualCodes);
+        }
+
+        void readSlot(int slot, boolean includeResidualCodes) throws IOException {
+            recordsInput.seek(recordsOffset + (long) slot * recordLength);
             recordsInput.readBytes(recordBytes, 0, recordLength);
             lower = recordBuffer.getFloat(0);
             final float upper = recordBuffer.getFloat(Float.BYTES);
@@ -277,7 +327,7 @@ final class QuantizedRescoreValues extends FloatVectorValues {
             }
             if (clusterId < 0 || clusterId >= numberOfCentroids) {
                 throw new IOException(
-                    "quantized rescore record [" + ord + "] refers to centroid [" + clusterId + "] of [" + numberOfCentroids + "]"
+                    "quantized rescore record in slot [" + slot + "] refers to centroid [" + clusterId + "] of [" + numberOfCentroids + "]"
                 );
             }
             cluster = clusterId;
@@ -351,6 +401,34 @@ final class QuantizedRescoreValues extends FloatVectorValues {
         @Override
         public float score() throws IOException {
             reader.read(scorerIterator.index(), includeResidual);
+            return scoreCurrentRecord();
+        }
+
+        void scoreOrdinals(int[] ordinals, int count, float[] scoresOut) throws IOException {
+            final long[] slotsAndPositions = new long[count];
+            for (int i = 0; i < count; i++) {
+                slotsAndPositions[i] = ((long) reader.slotOf(ordinals[i]) << Integer.SIZE) | i;
+            }
+            Arrays.sort(slotsAndPositions);
+            int runStart = 0;
+            while (runStart < count) {
+                final int firstSlot = (int) (slotsAndPositions[runStart] >>> Integer.SIZE);
+                int runEnd = runStart;
+                while (runEnd + 1 < count && (int) (slotsAndPositions[runEnd + 1] >>> Integer.SIZE) <= (int) (slotsAndPositions[runEnd]
+                    >>> Integer.SIZE) + 1) {
+                    runEnd++;
+                }
+                final int lastSlot = (int) (slotsAndPositions[runEnd] >>> Integer.SIZE);
+                reader.prefetchSlots(firstSlot, lastSlot - firstSlot + 1);
+                runStart = runEnd + 1;
+            }
+            for (int i = 0; i < count; i++) {
+                reader.readSlot((int) (slotsAndPositions[i] >>> Integer.SIZE), includeResidual);
+                scoresOut[(int) slotsAndPositions[i]] = scoreCurrentRecord();
+            }
+        }
+
+        private float scoreCurrentRecord() throws IOException {
             float dot = centroidDot(reader.cluster);
             float osqCodeDot = 0;
             for (int i = 0; i < dimension; i++) {

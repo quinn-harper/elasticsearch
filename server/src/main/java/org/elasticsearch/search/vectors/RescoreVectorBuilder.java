@@ -29,16 +29,18 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
 
     public static final ParseField OVERSAMPLE_FIELD = new ParseField("oversample");
     public static final ParseField QUANTIZED_FIELD = new ParseField("quantized");
+    public static final ParseField SEQUENTIAL_READ_FIELD = new ParseField("sequential_read");
     public static final float NO_OVERSAMPLE = 0.0F;
     public static final float MIN_OVERSAMPLE = 1.0F;
     private static final ConstructingObjectParser<RescoreVectorBuilder, Void> PARSER = new ConstructingObjectParser<>(
         "rescore_vector",
-        args -> new RescoreVectorBuilder((Float) args[0], (Boolean) args[1])
+        args -> new RescoreVectorBuilder((Float) args[0], (Boolean) args[1], (Boolean) args[2])
     );
 
     static {
         PARSER.declareFloat(ConstructingObjectParser.constructorArg(), OVERSAMPLE_FIELD);
         PARSER.declareBoolean(ConstructingObjectParser.optionalConstructorArg(), QUANTIZED_FIELD);
+        PARSER.declareBoolean(ConstructingObjectParser.optionalConstructorArg(), SEQUENTIAL_READ_FIELD);
     }
 
     public static final TransportVersion RESCORE_VECTOR_ALLOW_ZERO = TransportVersion.fromName("rescore_vector_allow_zero");
@@ -47,16 +49,23 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
     // Oversample is required as of now, quantized is an optional opt out of rescoring with stored quantized residual codes
     private final float oversample;
     private final Boolean quantized;
+    private final Boolean sequentialRead;
 
     public RescoreVectorBuilder(float numCandidatesFactor) {
-        this(numCandidatesFactor, null);
+        this(numCandidatesFactor, null, null);
+    }
+
+    public RescoreVectorBuilder(float numCandidatesFactor, Boolean quantized) {
+        this(numCandidatesFactor, quantized, null);
     }
 
     /**
      * @param quantized {@code false} to rescore with the raw vectors even when the segment stores quantized residual codes,
      *                  {@code true} or {@code null} to use the residual codes when the segment has them
+     * @param sequentialRead {@code true} to read the stored quantized residual codes of all candidates in storage order,
+     *                       {@code false} or {@code null} to read them one candidate at a time in document order
      */
-    public RescoreVectorBuilder(float numCandidatesFactor, Boolean quantized) {
+    public RescoreVectorBuilder(float numCandidatesFactor, Boolean quantized, Boolean sequentialRead) {
         Objects.requireNonNull(numCandidatesFactor, "[" + OVERSAMPLE_FIELD.getPreferredName() + "] must be set");
         if (numCandidatesFactor < MIN_OVERSAMPLE && numCandidatesFactor != NO_OVERSAMPLE) {
             throw new IllegalArgumentException("[" + OVERSAMPLE_FIELD.getPreferredName() + "] must be >= " + MIN_OVERSAMPLE + " or 0");
@@ -64,13 +73,23 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
         if (quantized != null && Build.current().isSnapshot() == false) {
             throw new IllegalArgumentException("[" + QUANTIZED_FIELD.getPreferredName() + "] is only supported on snapshot builds");
         }
+        if (sequentialRead != null && Build.current().isSnapshot() == false) {
+            throw new IllegalArgumentException("[" + SEQUENTIAL_READ_FIELD.getPreferredName() + "] is only supported on snapshot builds");
+        }
         this.oversample = numCandidatesFactor;
         this.quantized = quantized;
+        this.sequentialRead = sequentialRead;
     }
 
     public RescoreVectorBuilder(StreamInput in) throws IOException {
         this.oversample = in.readFloat();
-        this.quantized = in.getTransportVersion().supports(RESCORE_VECTOR_QUANTIZED) ? in.readOptionalBoolean() : null;
+        if (in.getTransportVersion().supports(RESCORE_VECTOR_QUANTIZED)) {
+            this.quantized = in.readOptionalBoolean();
+            this.sequentialRead = in.readOptionalBoolean();
+        } else {
+            this.quantized = null;
+            this.sequentialRead = null;
+        }
     }
 
     @Override
@@ -90,6 +109,7 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
         // A node that does not know the field only rescores with raw vectors, which is what quantized=false asks for
         if (out.getTransportVersion().supports(RESCORE_VECTOR_QUANTIZED)) {
             out.writeOptionalBoolean(quantized);
+            out.writeOptionalBoolean(sequentialRead);
         }
     }
 
@@ -99,6 +119,9 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
         builder.field(OVERSAMPLE_FIELD.getPreferredName(), oversample);
         if (quantized != null) {
             builder.field(QUANTIZED_FIELD.getPreferredName(), quantized);
+        }
+        if (sequentialRead != null) {
+            builder.field(SEQUENTIAL_READ_FIELD.getPreferredName(), sequentialRead);
         }
         builder.endObject();
         return builder;
@@ -113,12 +136,14 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         RescoreVectorBuilder that = (RescoreVectorBuilder) o;
-        return Objects.equals(oversample, that.oversample) && Objects.equals(quantized, that.quantized);
+        return Objects.equals(oversample, that.oversample)
+            && Objects.equals(quantized, that.quantized)
+            && Objects.equals(sequentialRead, that.sequentialRead);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(oversample, quantized);
+        return Objects.hash(oversample, quantized, sequentialRead);
     }
 
     public float oversample() {
@@ -128,5 +153,10 @@ public class RescoreVectorBuilder implements Writeable, ToXContentObject {
     /** {@code null} when the request did not say, which means to use quantized residual codes where a segment has them. */
     public Boolean quantized() {
         return quantized;
+    }
+
+    /** {@code null} when the request did not say, which means to read stored quantized residual codes one candidate at a time. */
+    public Boolean sequentialRead() {
+        return sequentialRead;
     }
 }
