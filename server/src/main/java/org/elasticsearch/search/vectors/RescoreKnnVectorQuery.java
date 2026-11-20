@@ -9,10 +9,15 @@
 
 package org.elasticsearch.search.vectors;
 
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.lucene95.HasIndexSlice;
+import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.queries.function.FunctionScoreQuery;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.ConjunctionUtils;
@@ -30,7 +35,11 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.ArrayUtil;
+import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescorer;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoringReader;
 import org.elasticsearch.lucene.store.ThreadConfinedArena;
 import org.elasticsearch.search.profile.query.QueryProfiler;
 
@@ -437,10 +446,15 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
                 }
                 var filterIterator = scorer.iterator();
 
-                final int vectorByteSize = knnVectorValues.getVectorByteLength();
-                final IndexInput input = getIndexSliceOrNull(knnVectorValues);
                 KnnVectorValues.DocIndexIterator vectorIter = knnVectorValues.iterator();
                 DocIdSetIterator conjunction = ConjunctionUtils.intersectIterators(List.of(vectorIter, filterIterator));
+                final QuantizedRescorer quantizedRescorer = quantizedRescorer(leaf.reader(), fieldName, target);
+                if (quantizedRescorer != null) {
+                    rescoreFromQuantizedCopy(quantizedRescorer, conjunction, vectorIter, leaf.docBase, results);
+                    continue;
+                }
+                final int vectorByteSize = knnVectorValues.getVectorByteLength();
+                final IndexInput input = getIndexSliceOrNull(knnVectorValues);
                 VectorScorer vecScorer = switch (target) {
                     case VectorQueryTarget.ByteTarget bt -> ((ByteVectorValues) knnVectorValues).rescorer(bt.vector());
                     case VectorQueryTarget.FloatTarget ft -> ((FloatVectorValues) knnVectorValues).rescorer(ft.vector());
@@ -470,6 +484,74 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             }
 
             return new KnnScoreDocQuery(results.toArray(ScoreDoc[]::new), indexSearcher.getIndexReader());
+        }
+
+        /**
+         * Scores the leaf's candidates from its quantized copy in record order. The copy stores records in posting list
+         * order, so once the candidates are sorted by record those of one cluster sit next to each other and the copy is
+         * read front to back. Reading in document order instead scatters the reads over the whole copy. Records are
+         * prefetched a window at a time ahead of scoring, like the raw rescore ring does.
+         */
+        private static void rescoreFromQuantizedCopy(
+            QuantizedRescorer rescorer,
+            DocIdSetIterator candidates,
+            KnnVectorValues.DocIndexIterator vectorIter,
+            int docBase,
+            List<ScoreDoc> results
+        ) throws IOException {
+            long[] recordsAndDocs = new long[PREFETCH_BUFFER_SIZE];
+            int count = 0;
+            int doc;
+            while ((doc = candidates.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                assert doc == vectorIter.docID();
+                recordsAndDocs = ArrayUtil.grow(recordsAndDocs, count + 1);
+                recordsAndDocs[count++] = ((long) rescorer.recordIndex(vectorIter.index()) << Integer.SIZE) | doc;
+            }
+            Arrays.sort(recordsAndDocs, 0, count);
+            for (int windowStart = 0; windowStart < count; windowStart += PREFETCH_BUFFER_SIZE) {
+                int windowEnd = Math.min(windowStart + PREFETCH_BUFFER_SIZE, count);
+                for (int i = windowStart; i < windowEnd; i++) {
+                    rescorer.prefetchRecord(recordIndexOf(recordsAndDocs[i]));
+                }
+                for (int i = windowStart; i < windowEnd; i++) {
+                    float score = rescorer.scoreRecord(recordIndexOf(recordsAndDocs[i]));
+                    results.add(new ScoreDoc(docOf(recordsAndDocs[i]) + docBase, score));
+                }
+            }
+        }
+
+        private static int recordIndexOf(long recordAndDoc) {
+            return (int) (recordAndDoc >>> Integer.SIZE);
+        }
+
+        private static int docOf(long recordAndDoc) {
+            return (int) recordAndDoc;
+        }
+
+        /**
+         * The segment's rescorer over the quantized copy of {@code fieldName}, or {@code null} when the segment's vector
+         * reader stores no such copy or the query is a byte vector, in which case the raw vectors are read.
+         */
+        private static QuantizedRescorer quantizedRescorer(LeafReader leafReader, String fieldName, VectorQueryTarget target)
+            throws IOException {
+            final float[] queryVector = switch (target) {
+                case VectorQueryTarget.FloatTarget floatTarget -> floatTarget.vector();
+                case VectorQueryTarget.ByteTarget ignored -> null;
+            };
+            if (queryVector == null) {
+                return null;
+            }
+            SegmentReader segmentReader = Lucene.tryUnwrapSegmentReader(leafReader);
+            if (segmentReader == null) {
+                return null;
+            }
+            KnnVectorsReader vectorsReader = segmentReader.getVectorReader();
+            if (vectorsReader instanceof PerFieldKnnVectorsFormat.FieldsReader perField) {
+                vectorsReader = perField.getFieldReader(fieldName);
+            }
+            return vectorsReader instanceof QuantizedRescoringReader quantizedReader
+                ? quantizedReader.quantizedRescorer(fieldName, queryVector)
+                : null;
         }
 
         private static IndexInput getIndexSliceOrNull(KnnVectorValues vectorValues) {

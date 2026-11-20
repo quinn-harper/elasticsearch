@@ -67,6 +67,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfQueryConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoreMeta;
 import org.elasticsearch.index.codec.vectors.diskbbq.es94.ES940DiskBBQVectorsFormat;
 import org.elasticsearch.index.codec.vectors.diskbbq.es95.ES950DiskBBQVectorsFormat;
 import org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskASHVectorsFormat;
@@ -501,7 +502,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     experimentalFeaturesEnabled,
                     null,
                     BBQIVFIndexOptions.QuantizationType.OSQ,
-                    false
+                    false,
+                    0
                 );
             }
 
@@ -2228,12 +2230,34 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 boolean onDiskRescore = XContentMapValues.nodeBooleanValue(onDiskRescoreNode, false);
 
                 BBQIVFIndexOptions.QuantizationType quantizationType;
+                int quantizedRescoreBits = 0;
                 if (Build.current().isSnapshot()) {
                     // Parse quantization_type before bits so we can set the correct default
                     String quantizationTypeString = XContentMapValues.nodeStringValue(indexOptionsMap.remove("quantization_type"), "osq");
                     quantizationType = BBQIVFIndexOptions.QuantizationType.fromString(quantizationTypeString);
+                    Object quantizedRescoreBitsNode = indexOptionsMap.remove("quantized_rescore_bits");
+                    if (quantizedRescoreBitsNode != null) {
+                        quantizedRescoreBits = XContentMapValues.nodeIntegerValue(quantizedRescoreBitsNode);
+                        if (QuantizedRescoreMeta.isSupportedBits(quantizedRescoreBits) == false) {
+                            throw new IllegalArgumentException(
+                                "quantized_rescore_bits must be one of ["
+                                    + QuantizedRescoreMeta.SUPPORTED_BITS
+                                    + "] for field ["
+                                    + fieldName
+                                    + "], got ["
+                                    + quantizedRescoreBits
+                                    + "]"
+                            );
+                        }
+                    }
                 } else {
                     quantizationType = BBQIVFIndexOptions.QuantizationType.OSQ;
+                }
+                if (quantizedRescoreBits != 0
+                    && (experimentalFeaturesEnabled == false || indexVersion.before(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE))) {
+                    throw new IllegalArgumentException(
+                        "quantized_rescore_bits requires experimental dense vector features for field [" + fieldName + "]"
+                    );
                 }
 
                 boolean isAsh = quantizationType == BBQIVFIndexOptions.QuantizationType.ASH;
@@ -2302,7 +2326,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                     experimentalFeaturesEnabled,
                     autoCalibrate,
                     quantizationType,
-                    onDiskMerge
+                    onDiskMerge,
+                    quantizedRescoreBits
                 );
             }
 
@@ -3082,6 +3107,14 @@ public class DenseVectorFieldMapper extends FieldMapper {
         final boolean experimentalFeaturesEnabled;
         final DenseVectorAutoCalibrate autoCalibrate;
         final QuantizationType quantizationType;
+        /**
+         * Bits per dimension of the quantized copy of each vector, kept in its own file, that candidates are rescored from,
+         * one of {@link QuantizedRescoreMeta#SUPPORTED_BITS}, or 0 when candidates are rescored from the float32 raw
+         * vectors. Only the ESNext formats keep such a copy, so the parser rejects a width unless the field is written with
+         * one of them. The option only affects newly written segments; the rescore query handles segments with and without
+         * a copy side by side.
+         */
+        final int quantizedRescoreBits;
 
         public enum QuantizationType {
             OSQ("osq"),
@@ -3122,7 +3155,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
             boolean experimentalFeaturesEnabled,
             @Nullable DenseVectorAutoCalibrate autoCalibrate,
             QuantizationType quantizationType,
-            boolean onDiskMerge
+            boolean onDiskMerge,
+            int quantizedRescoreBits
         ) {
             super(VectorIndexType.BBQ_DISK, rescoreVector, onDiskMerge);
             if (bits == null && quantizationType != QuantizationType.ASH) {
@@ -3138,6 +3172,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
             this.experimentalFeaturesEnabled = experimentalFeaturesEnabled;
             this.autoCalibrate = autoCalibrate == null ? DenseVectorAutoCalibrate.defaultAutoCalibrate(indexVersionCreated) : autoCalibrate;
             this.quantizationType = quantizationType;
+            this.quantizedRescoreBits = quantizedRescoreBits == 0 ? 0 : QuantizedRescoreMeta.checkBits(quantizedRescoreBits);
         }
 
         @Override
@@ -3185,7 +3220,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         IvfMergeConfigResolver.useCodecDefault(),
-                        onDiskMerge
+                        onDiskMerge,
+                        getQuantizedRescoreBits()
                     );
                 } else {
                     IvfMergeConfigResolver mergeConfigResolver = autoCalibrate()
@@ -3205,7 +3241,8 @@ public class DenseVectorFieldMapper extends FieldMapper {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         mergeConfigResolver,
-                        onDiskMerge
+                        onDiskMerge,
+                        getQuantizedRescoreBits()
                     );
                 }
             } else if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE)) {
@@ -3265,6 +3302,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 && doPrecondition == that.doPrecondition
                 && Objects.equals(autoCalibrate, that.autoCalibrate)
                 && Objects.equals(quantizationType, that.quantizationType)
+                && quantizedRescoreBits == that.quantizedRescoreBits
                 && Objects.equals(rescoreVector, that.rescoreVector);
         }
 
@@ -3279,6 +3317,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 doPrecondition,
                 autoCalibrate,
                 quantizationType,
+                quantizedRescoreBits,
                 rescoreVector
             );
         }
@@ -3310,6 +3349,9 @@ public class DenseVectorFieldMapper extends FieldMapper {
             if (quantizationType == QuantizationType.ASH) {
                 builder.field("quantization_type", quantizationType);
             }
+            if (quantizedRescoreBits != 0) {
+                builder.field("quantized_rescore_bits", quantizedRescoreBits);
+            }
         }
 
         public int getClusterSize() {
@@ -3326,6 +3368,11 @@ public class DenseVectorFieldMapper extends FieldMapper {
 
         public boolean isOnDiskRescore() {
             return onDiskRescore;
+        }
+
+        /** Bits per dimension of the quantized rescore copy newly written segments keep, or 0 when they keep none. */
+        public int getQuantizedRescoreBits() {
+            return quantizedRescoreBits;
         }
 
         public boolean doPrecondition() {

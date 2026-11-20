@@ -268,6 +268,9 @@ public class KnnIndexTester {
                         suffix.add("q" + args.queryQuantizeBits());
                     }
                 }
+                if (args.quantizedRescoreBits() != null) {
+                    suffix.add("qr" + args.quantizedRescoreBits());
+                }
             }
             case HNSW -> {
                 suffix.add(Integer.toString(args.hnswM()));
@@ -344,7 +347,8 @@ public class KnnIndexTester {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         IvfMergeConfigResolver.useCodecDefault(),
-                        false
+                        false,
+                        Objects.requireNonNullElse(args.quantizedRescoreBits(), 0)
                     );
                 } else {
                     var encoding = resolveQuantEncoding(quantizeBits, args.queryQuantizeBits());
@@ -365,7 +369,8 @@ public class KnnIndexTester {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         mergeConfigResolver,
-                        false
+                        false,
+                        Objects.requireNonNullElse(args.quantizedRescoreBits(), 0)
                     );
                 }
             }
@@ -1385,6 +1390,7 @@ public class KnnIndexTester {
         "merge_policy",
         "on_disk_rescore",
         "precondition",
+        "quantized_rescore_bits",
         "flat_vector_threshold",
         "top_k",
         "num_candidates",
@@ -1500,6 +1506,7 @@ public class KnnIndexTester {
                             config.mergePolicy() != null ? config.mergePolicy().name().toLowerCase(Locale.ROOT) : "",
                             Boolean.toString(config.onDiskRescore()),
                             Boolean.toString(config.doPrecondition()),
+                            config.quantizedRescoreBits() != null ? Integer.toString(config.quantizedRescoreBits()) : "",
                             Integer.toString(config.flatVectorThreshold()),
                             Integer.toString(sp.topK()),
                             Integer.toString(sp.numCandidates()),

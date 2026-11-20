@@ -1408,6 +1408,91 @@ public class DenseVectorFieldMapperTests extends SyntheticVectorsMapperTestCase 
         );
     }
 
+    /**
+     * {@code quantized_rescore_bits} turns on rescoring from a quantized copy of each vector kept by the ESNext formats and
+     * picks its width, 2, 4 or 8 bits. It is off when absent, stored in the mapping when set, survives a reparse of the
+     * stored mapping, and is rejected for other widths.
+     */
+    public void testQuantizedRescoreBitsParsing() throws IOException {
+        assumeTrue("quantized_rescore_bits requires a snapshot build", Build.current().isSnapshot());
+
+        MapperService off = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, quantizedRescoreMapping(null));
+        assertEquals(0, quantizedRescoreBitsOf(off));
+        assertThat(off.documentMapper().mappingSource().toString(), not(containsString("quantized_rescore")));
+
+        for (int bits : new int[] { 2, 4, 8 }) {
+            MapperService mapperService = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, quantizedRescoreMapping(bits));
+            assertEquals(bits, quantizedRescoreBitsOf(mapperService));
+            String mappingSource = mapperService.documentMapper().mappingSource().toString();
+            assertThat(mappingSource, containsString("\"quantized_rescore_bits\":" + bits));
+
+            MapperService recovered = new TestMapperServiceBuilder().settings(EXPERIMENTAL_FEATURES_ENABLED).build();
+            merge(recovered, MapperService.MergeReason.MAPPING_RECOVERY, mappingSource);
+            assertEquals(bits, quantizedRescoreBitsOf(recovered));
+        }
+
+        Exception e = expectThrows(
+            MapperParsingException.class,
+            () -> createMapperService(EXPERIMENTAL_FEATURES_ENABLED, quantizedRescoreMapping(3))
+        );
+        assertThat(e.getMessage(), containsString("quantized_rescore_bits must be one of [2, 4 or 8] for field [field], got [3]"));
+    }
+
+    /** The copy exists only in the ESNext formats, so {@code quantized_rescore_bits} needs a field written with one of them. */
+    public void testQuantizedRescoreBitsRequiresExperimentalFeatures() throws IOException {
+        assumeTrue("quantized_rescore_bits requires a snapshot build", Build.current().isSnapshot());
+
+        IndexVersion preResidualVersion = IndexVersionUtils.getPreviousVersion(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE);
+        List<Tuple<IndexVersion, Settings>> unsupported = List.of(
+            Tuple.tuple(IndexVersion.current(), EXPERIMENTAL_FEATURES_DISABLED),
+            Tuple.tuple(preResidualVersion, EXPERIMENTAL_FEATURES_ENABLED)
+        );
+        for (Tuple<IndexVersion, Settings> candidate : unsupported) {
+            String message = "version [" + candidate.v1() + "] settings [" + candidate.v2() + "]";
+            Exception e = expectThrows(
+                MapperParsingException.class,
+                () -> createMapperService(candidate.v1(), candidate.v2(), quantizedRescoreMapping(8))
+            );
+            assertThat(
+                message,
+                e.getMessage(),
+                containsString("quantized_rescore_bits requires experimental dense vector features for field [field]")
+            );
+
+            MapperService mapperService = createMapperService(candidate.v1(), candidate.v2(), quantizedRescoreMapping(null));
+            assertEquals(message, 0, quantizedRescoreBitsOf(mapperService));
+        }
+    }
+
+    /**
+     * {@code quantized_rescore_bits} only affects segments written after the change, so a mapping update may set, change or
+     * drop it.
+     */
+    public void testQuantizedRescoreBitsIsUpdatable() throws IOException {
+        assumeTrue("quantized_rescore_bits requires a snapshot build", Build.current().isSnapshot());
+
+        MapperService mapperService = createMapperService(EXPERIMENTAL_FEATURES_ENABLED, quantizedRescoreMapping(null));
+        merge(mapperService, quantizedRescoreMapping(4));
+        assertEquals(4, quantizedRescoreBitsOf(mapperService));
+        merge(mapperService, quantizedRescoreMapping(8));
+        assertEquals(8, quantizedRescoreBitsOf(mapperService));
+        merge(mapperService, quantizedRescoreMapping(null));
+        assertEquals(0, quantizedRescoreBitsOf(mapperService));
+    }
+
+    private static XContentBuilder quantizedRescoreMapping(@Nullable Integer quantizedRescoreBits) throws IOException {
+        Map<String, Object> indexOptions = new HashMap<>();
+        indexOptions.put("type", "bbq_disk");
+        if (quantizedRescoreBits != null) {
+            indexOptions.put("quantized_rescore_bits", quantizedRescoreBits);
+        }
+        return fieldMapping(b -> new DenseVectorMappingBuilder().dims(128).index(true).indexOptions(indexOptions).build(b));
+    }
+
+    private static int quantizedRescoreBitsOf(MapperService mapperService) {
+        return getIndexOptions(mapperService, "field", DenseVectorFieldMapper.BBQIVFIndexOptions.class).getQuantizedRescoreBits();
+    }
+
     public void testRescoreVectorForNonQuantized() {
         for (String indexType : List.of("hnsw", "flat")) {
             Exception e = expectThrows(

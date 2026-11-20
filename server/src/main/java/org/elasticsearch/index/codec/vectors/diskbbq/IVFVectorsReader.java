@@ -25,11 +25,20 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.search.VectorScorer;
+import org.apache.lucene.util.hnsw.RandomVectorScorer;
+import org.elasticsearch.index.codec.vectors.VectorScoringUtils;
+import org.elasticsearch.simdvec.ESVectorUtil;
 import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.DataAccessHint;
 import org.apache.lucene.store.DataInput;
+import org.apache.lucene.store.FileDataHint;
+import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.index.codec.vectors.GenericFlatVectorReaders;
 import org.elasticsearch.index.codec.vectors.cluster.ClusteringFloatVectorValues;
@@ -49,7 +58,7 @@ import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.SIMILA
 /**
  * Reader for IVF vectors. This reader is used to read the IVF vectors from the index.
  */
-public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> extends KnnVectorsReader {
+public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> extends KnnVectorsReader implements QuantizedRescoringReader {
 
     /**
      * Sealed query target for IVF search dispatch. Allows the search path to handle
@@ -106,6 +115,12 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
     protected static final int NO_ON_DISK_MERGE_IN_META = -1;
 
     protected final IndexInput ivfCentroids, ivfClusters;
+    /** The quantized rescore file, or {@code null} when this codec version or this segment has none. */
+    protected final IndexInput ivfQuantizedRescore;
+    private final String quantizedRescoreExtension;
+    private final int versionQuantizedRescore;
+    /** Where each field's quantized rescore copy is, by field number; fields without a copy are absent. */
+    private final IntObjectHashMap<QuantizedRescoreMeta> quantizedRescoreMetas;
     private final SegmentReadState state;
     protected final FieldInfos fieldInfos;
     protected final IntObjectHashMap<E> fields;
@@ -117,7 +132,6 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
     private final float dynamicVisitRatio;
     protected int versionMeta = -1;
 
-    @SuppressWarnings("this-escape")
     protected IVFVectorsReader(
         SegmentReadState state,
         GenericFlatVectorReaders.LoadFlatVectorsReader loadReader,
@@ -131,9 +145,51 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         int versionOnDiskMerge,
         float dynamicVisitRatio
     ) throws IOException {
+        this(
+            state,
+            loadReader,
+            codecName,
+            centroidExtension,
+            clusterExtension,
+            metaExtension,
+            versionStart,
+            versionCurrent,
+            versionDirectIo,
+            versionOnDiskMerge,
+            dynamicVisitRatio,
+            null,
+            Integer.MAX_VALUE
+        );
+    }
+
+    /**
+     * @param quantizedRescoreExtension extension of the file holding the quantized rescore copies, or {@code null} when this
+     *                                  codec version has none
+     * @param versionQuantizedRescore   the first meta version whose segments carry that file; older segments leave
+     *                                  {@link #ivfQuantizedRescore} null
+     */
+    @SuppressWarnings("this-escape")
+    protected IVFVectorsReader(
+        SegmentReadState state,
+        GenericFlatVectorReaders.LoadFlatVectorsReader loadReader,
+        String codecName,
+        String centroidExtension,
+        String clusterExtension,
+        String metaExtension,
+        int versionStart,
+        int versionCurrent,
+        int versionDirectIo,
+        int versionOnDiskMerge,
+        float dynamicVisitRatio,
+        String quantizedRescoreExtension,
+        int versionQuantizedRescore
+    ) throws IOException {
         this.state = state;
         this.fieldInfos = state.fieldInfos;
         this.fields = new IntObjectHashMap<>();
+        this.quantizedRescoreExtension = quantizedRescoreExtension;
+        this.versionQuantizedRescore = versionQuantizedRescore;
+        this.quantizedRescoreMetas = new IntObjectHashMap<>();
         this.genericReaders = new GenericFlatVectorReaders();
         this.centroidExtension = centroidExtension;
         this.clusterExtension = clusterExtension;
@@ -163,6 +219,17 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
             }
             ivfCentroids = openDataInput(state, versionMeta, centroidExtension, codecName, versionStart, versionCurrent, state.context);
             ivfClusters = openDataInput(state, versionMeta, clusterExtension, codecName, versionStart, versionCurrent, state.context);
+            ivfQuantizedRescore = quantizedRescoreExtension != null && versionMeta >= versionQuantizedRescore
+                ? openDataInput(
+                    state,
+                    versionMeta,
+                    quantizedRescoreExtension,
+                    codecName,
+                    versionStart,
+                    versionCurrent,
+                    state.context.withHints(FileTypeHint.DATA, FileDataHint.KNN_VECTORS, DataAccessHint.RANDOM)
+                )
+                : null;
         } catch (Throwable t) {
             IOUtils.closeWhileHandlingException(this);
             throw t;
@@ -186,6 +253,10 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         this.versionMeta = other.versionMeta;
         this.ivfCentroids = other.ivfCentroids;
         this.ivfClusters = other.ivfClusters;
+        this.ivfQuantizedRescore = other.ivfQuantizedRescore;
+        this.quantizedRescoreExtension = other.quantizedRescoreExtension;
+        this.versionQuantizedRescore = other.versionQuantizedRescore;
+        this.quantizedRescoreMetas = other.quantizedRescoreMetas;
     }
 
     public abstract CentroidIterator getCentroidIterator(
@@ -289,6 +360,12 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
             input.readFloats(globalCentroid, 0, globalCentroid.length);
             globalCentroidDp = Float.intBitsToFloat(input.readInt());
         }
+        if (quantizedRescoreExtension != null && versionMeta >= versionQuantizedRescore) {
+            final QuantizedRescoreMeta rescoreMeta = QuantizedRescoreMeta.read(input);
+            if (rescoreMeta != null) {
+                quantizedRescoreMetas.put(info.number, rescoreMeta);
+            }
+        }
         return doReadField(
             input,
             rawVectorFormat,
@@ -343,6 +420,9 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         }
         CodecUtil.checksumEntireFile(ivfCentroids);
         CodecUtil.checksumEntireFile(ivfClusters);
+        if (ivfQuantizedRescore != null) {
+            CodecUtil.checksumEntireFile(ivfQuantizedRescore);
+        }
     }
 
     @Override
@@ -616,13 +696,139 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         }
 
         var centroidsClusters = Map.of(centroidExtension, fe.centroidLength, clusterExtension, fe.postingListLength);
-        return KnnVectorsReader.mergeOffHeapByteSizeMaps(raw, centroidsClusters);
+        var sizes = KnnVectorsReader.mergeOffHeapByteSizeMaps(raw, centroidsClusters);
+        if (ivfQuantizedRescore != null) {
+            final QuantizedRescoreMeta rescoreMeta = quantizedRescoreMetas.get(fieldInfo.number);
+            final long copyLength = rescoreMeta == null ? 0L : rescoreMeta.length(fieldInfo.getVectorDimension());
+            sizes = KnnVectorsReader.mergeOffHeapByteSizeMaps(sizes, Map.of(quantizedRescoreExtension, copyLength));
+        }
+        return sizes;
+    }
+
+    @Override
+    public QuantizedRescorer quantizedRescorer(String field, float[] target) throws IOException {
+        final FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+        if (fieldInfo == null || ivfQuantizedRescore == null) {
+            return null;
+        }
+        final QuantizedRescoreMeta rescoreMeta = quantizedRescoreMetas.get(fieldInfo.number);
+        if (rescoreMeta == null) {
+            return null;
+        }
+        final FloatVectorValues values = getFloatVectorValues(field);
+        if (values == null || values.size() == 0) {
+            return null;
+        }
+        final int dimension = fieldInfo.getVectorDimension();
+        if (target.length != dimension) {
+            throw new IllegalArgumentException("vector query dimension: " + target.length + " differs from field dimension: " + dimension);
+        }
+        return new QuantizedCopyRescorer(values, rescoreMeta, ivfQuantizedRescore, target, fieldInfo.getVectorSimilarityFunction());
+    }
+
+    /**
+     * Rescores one field from its quantized copy. Each score seeks to one record, reads its codes and corrections and
+     * reconstructs the dot product with the query, so the cost per candidate is one small read plus one dot product.
+     */
+    private static final class QuantizedCopyRescorer implements QuantizedRescorer {
+        private final IndexInput records;
+        private final RandomAccessInput ordinalTable;
+        private final float[] target;
+        private final float queryComponentSum;
+        private final float querySquaredNorm;
+        private final VectorSimilarityFunction similarityFunction;
+        private final int dimension;
+        private final int bits;
+        private final long recordSize;
+        private final float codeStep;
+        private final int codeOffset;
+        private final int packedLength;
+        private final byte[] packed;
+        private final byte[] codes;
+        private final float[] corrections = new float[3];
+        private final VectorScorer vectorScorer;
+
+        QuantizedCopyRescorer(
+            FloatVectorValues values,
+            QuantizedRescoreMeta rescoreMeta,
+            IndexInput quantizedRescoreFile,
+            float[] target,
+            VectorSimilarityFunction similarityFunction
+        ) throws IOException {
+            this.dimension = values.dimension();
+            this.records = rescoreMeta.records(quantizedRescoreFile, dimension);
+            this.ordinalTable = rescoreMeta.ordinalTable(quantizedRescoreFile, dimension);
+            this.target = target;
+            float querySum = 0f;
+            for (float component : target) {
+                querySum += component;
+            }
+            this.queryComponentSum = querySum;
+            this.querySquaredNorm = VectorUtil.dotProduct(target, target);
+            this.similarityFunction = similarityFunction;
+            this.bits = rescoreMeta.bits();
+            this.recordSize = rescoreMeta.recordSize(dimension);
+            this.codeStep = 1f / ((1 << bits) - 1);
+            this.codeOffset = QuantizedRescoreCodes.codeOffset(bits);
+            this.packedLength = QuantizedRescoreCodes.packedLength(dimension, bits);
+            this.packed = packedLength == dimension ? null : new byte[packedLength];
+            this.codes = new byte[dimension];
+            final RandomVectorScorer randomScorer = new RandomVectorScorer.AbstractRandomVectorScorer(values) {
+                @Override
+                public float score(int ord) throws IOException {
+                    return scoreRecord(recordIndex(ord));
+                }
+            };
+            this.vectorScorer = VectorScoringUtils.sparseVectorScorer(randomScorer, values.iterator());
+        }
+
+        @Override
+        public VectorScorer scorer() {
+            return vectorScorer;
+        }
+
+        @Override
+        public int recordIndex(int ord) throws IOException {
+            return ordinalTable.readInt((long) ord * Integer.BYTES);
+        }
+
+        @Override
+        public void prefetchRecord(int recordIndex) throws IOException {
+            records.prefetch(recordIndex * recordSize, recordSize);
+        }
+
+        @Override
+        public float scoreRecord(int recordIndex) throws IOException {
+            records.seek(recordIndex * recordSize);
+            if (packed == null) {
+                records.readBytes(codes, 0, dimension);
+            } else {
+                records.readBytes(packed, 0, packedLength);
+                QuantizedRescoreCodes.unpack(packed, dimension, bits, codes);
+            }
+            records.readFloats(corrections, 0, 3);
+            final float lowerInterval = corrections[0];
+            final float upperInterval = corrections[1];
+            final float additionalCorrection = corrections[2];
+            final float codeScale = (upperInterval - lowerInterval) * codeStep;
+            final float codeDotProduct = ESVectorUtil.ipFloatByte(target, codes);
+            final float dotProduct = (lowerInterval + codeScale * codeOffset) * queryComponentSum + codeScale * codeDotProduct;
+            return switch (similarityFunction) {
+                case EUCLIDEAN -> Math.max(1f / (1f + querySquaredNorm + additionalCorrection - 2f * dotProduct), 0f);
+                case DOT_PRODUCT -> Math.max((1f + dotProduct) / 2f, 0f);
+                case MAXIMUM_INNER_PRODUCT -> VectorUtil.scaleMaxInnerProductScore(dotProduct);
+                case COSINE -> throw new IllegalStateException("quantized rescore copies are not written for cosine fields");
+            };
+        }
     }
 
     @Override
     public void close() throws IOException {
         List<Closeable> closeables = new ArrayList<>(genericReaders.allReaders());
         Collections.addAll(closeables, ivfCentroids, ivfClusters);
+        if (ivfQuantizedRescore != null) {
+            closeables.add(ivfQuantizedRescore);
+        }
         IOUtils.close(closeables);
     }
 

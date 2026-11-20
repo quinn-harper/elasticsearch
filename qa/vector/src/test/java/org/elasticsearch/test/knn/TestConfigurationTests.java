@@ -182,6 +182,59 @@ public class TestConfigurationTests extends ESTestCase {
         }
     }
 
+    public void testQuantizedRescoreBitsParsing() throws Exception {
+        String base = """
+            {
+              "doc_vectors": ["/path/to/docs"],
+              "dimensions": 128,
+              "index_type": "%s",
+              "quantize_bits": 1%s
+            }
+            """;
+        KnnIndexTester.DirectoryTypeConfig defaultDir = KnnIndexTester.getDirectoryTypeConfig("default");
+
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), Strings.format(base, "ivf", ""))) {
+            TestConfiguration config = TestConfiguration.fromXContent(parser);
+            assertNull("no quantized rescore copy unless its width is set", config.quantizedRescoreBits());
+            assertThat(KnnIndexTester.formatIndexPath(config, defaultDir), not(containsString("-qr")));
+        }
+
+        for (int bits : new int[] { 2, 4, 8 }) {
+            String json = Strings.format(base, "ivf", ", \"quantized_rescore_bits\": " + bits);
+            try (XContentParser parser = createParser(XContentType.JSON.xContent(), json)) {
+                TestConfiguration config = TestConfiguration.fromXContent(parser);
+                assertEquals(Integer.valueOf(bits), config.quantizedRescoreBits());
+                assertThat(KnnIndexTester.formatIndexPath(config, defaultDir), containsString("-qr" + bits + ".index"));
+            }
+        }
+
+        String ash = """
+            {
+              "doc_vectors": ["/path/to/docs"],
+              "dimensions": 128,
+              "index_type": "ivf",
+              "quantization_type": "ash",
+              "quantized_rescore_bits": 4
+            }
+            """;
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), ash)) {
+            TestConfiguration config = TestConfiguration.fromXContent(parser);
+            assertThat(KnnIndexTester.formatIndexPath(config, defaultDir), containsString("-qr4.index"));
+        }
+
+        String unsupportedWidth = Strings.format(base, "ivf", ", \"quantized_rescore_bits\": 3");
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), unsupportedWidth)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> TestConfiguration.fromXContent(parser));
+            assertThat(e.getMessage(), containsString("quantized_rescore_bits must be 2, 4 or 8"));
+        }
+
+        String hnswWithCopy = Strings.format(base, "hnsw", ", \"quantized_rescore_bits\": 8");
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), hnswWithCopy)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> TestConfiguration.fromXContent(parser));
+            assertThat(e.getMessage(), containsString("quantized_rescore_bits only applies when index_type is ivf"));
+        }
+    }
+
     public void testQueryQuantizeBitsParsing() throws Exception {
         String json = """
             {

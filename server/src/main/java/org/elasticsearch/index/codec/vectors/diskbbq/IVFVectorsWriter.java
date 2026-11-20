@@ -27,11 +27,13 @@ import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.DataAccessHint;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.IORunnable;
 import org.apache.lucene.util.LongValues;
+import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.index.codec.vectors.cluster.CentroidOps;
@@ -46,6 +48,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.AbstractList;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsReader.SIMILARITY_FUNCTIONS;
@@ -59,6 +62,8 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
     private final List<FieldWriter> fieldWriters = new ArrayList<>();
     private final IndexOutput ivfCentroids, ivfClusters;
     private final IndexOutput ivfMeta;
+    private final IndexOutput ivfQuantizedRescore;
+    private final int quantizedRescoreBits;
     private final String rawVectorFormatName;
     private final Boolean useDirectIOReads;
     private final boolean onDiskMerge;
@@ -76,7 +81,6 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
     }
 
     /** @param shouldWriteOnDiskMerge whether this codec version records {@code onDiskMerge} in the meta */
-    @SuppressWarnings("this-escape")
     protected IVFVectorsWriter(
         SegmentWriteState state,
         String rawVectorFormatName,
@@ -92,7 +96,53 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         boolean onDiskMerge,
         boolean shouldWriteOnDiskMerge
     ) throws IOException {
+        this(
+            state,
+            rawVectorFormatName,
+            useDirectIOReads,
+            rawVectorDelegate,
+            writeVersion,
+            codecName,
+            metaExtension,
+            centroidExtension,
+            clusterExtension,
+            shouldWriteDirectIoReads,
+            flatVectorThreshold,
+            onDiskMerge,
+            shouldWriteOnDiskMerge,
+            null,
+            0
+        );
+    }
+
+    /**
+     * @param shouldWriteOnDiskMerge     whether this codec version records {@code onDiskMerge} in the meta
+     * @param quantizedRescoreExtension  extension of the file that holds the quantized rescore copies, or {@code null} when
+     *                                   this codec version has no such file
+     * @param quantizedRescoreBits       bits per dimension of the quantized rescore copy float fields get, one of
+     *                                   {@link QuantizedRescoreMeta#SUPPORTED_BITS}, or 0 for no copy; the file is created
+     *                                   either way so readers of this codec version can always open it
+     */
+    @SuppressWarnings("this-escape")
+    protected IVFVectorsWriter(
+        SegmentWriteState state,
+        String rawVectorFormatName,
+        Boolean useDirectIOReads,
+        FlatVectorsWriter rawVectorDelegate,
+        int writeVersion,
+        String codecName,
+        String metaExtension,
+        String centroidExtension,
+        String clusterExtension,
+        boolean shouldWriteDirectIoReads,
+        int flatVectorThreshold,
+        boolean onDiskMerge,
+        boolean shouldWriteOnDiskMerge,
+        String quantizedRescoreExtension,
+        int quantizedRescoreBits
+    ) throws IOException {
         this.rawVectorFormatName = rawVectorFormatName;
+        this.quantizedRescoreBits = quantizedRescoreBits == 0 ? 0 : QuantizedRescoreMeta.checkBits(quantizedRescoreBits);
         this.onDiskMerge = onDiskMerge;
         this.shouldWriteOnDiskMerge = shouldWriteOnDiskMerge;
         this.useDirectIOReads = useDirectIOReads;
@@ -110,9 +160,142 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             CodecUtil.writeIndexHeader(ivfCentroids, codecName, writeVersion, state.segmentInfo.getId(), state.segmentSuffix);
             ivfClusters = state.directory.createOutput(ivfClustersFileName, state.context);
             CodecUtil.writeIndexHeader(ivfClusters, codecName, writeVersion, state.segmentInfo.getId(), state.segmentSuffix);
+            if (quantizedRescoreExtension != null) {
+                final String quantizedRescoreFileName = IndexFileNames.segmentFileName(
+                    state.segmentInfo.name,
+                    state.segmentSuffix,
+                    quantizedRescoreExtension
+                );
+                ivfQuantizedRescore = state.directory.createOutput(quantizedRescoreFileName, state.context);
+                CodecUtil.writeIndexHeader(ivfQuantizedRescore, codecName, writeVersion, state.segmentInfo.getId(), state.segmentSuffix);
+            } else {
+                ivfQuantizedRescore = null;
+            }
         } catch (Throwable t) {
             IOUtils.closeWhileHandlingException(this);
             throw t;
+        }
+    }
+
+    /**
+     * A field's quantized rescore records in flat vector ordinal order, parked in a temporary file until the posting lists
+     * have fixed the order the final copy is written in. The records are taken before preconditioning at flush and from the
+     * merged raw vectors at merge, because the rescore query scores them against the raw query vector.
+     */
+    private record QuantizedRescoreTemp(String fileName, int vectorCount) {}
+
+    /**
+     * Parks the records of a field flushed from memory, see {@link QuantizedRescoreTemp}, or returns {@code null} when this
+     * writer keeps no copy.
+     */
+    private QuantizedRescoreTemp writeQuantizedRescoreTemp(FieldInfo fieldInfo, KMeansFloatVectorValues vectors) throws IOException {
+        if (quantizedRescoreBits == 0 || ivfQuantizedRescore == null || vectors.size() == 0) {
+            return null;
+        }
+        return writeQuantizedRescoreTemp(fieldInfo, vectors.size(), recordWriter -> {
+            for (int ord = 0; ord < vectors.size(); ord++) {
+                recordWriter.write(vectors.vectorValue(ord));
+            }
+        });
+    }
+
+    /**
+     * Parks the records of a merged field from the merged raw vectors, which come in the ordinal order of the merged flat
+     * vector file, see {@link QuantizedRescoreTemp}, or returns {@code null} when this writer keeps no copy.
+     */
+    private QuantizedRescoreTemp writeQuantizedRescoreTemp(FieldInfo fieldInfo, FloatVectorValues vectors) throws IOException {
+        if (quantizedRescoreBits == 0 || ivfQuantizedRescore == null || vectors.size() == 0) {
+            return null;
+        }
+        return writeQuantizedRescoreTemp(fieldInfo, vectors.size(), recordWriter -> {
+            final KnnVectorValues.DocIndexIterator iterator = vectors.iterator();
+            for (int doc = iterator.nextDoc(); doc != NO_MORE_DOCS; doc = iterator.nextDoc()) {
+                recordWriter.write(vectors.vectorValue(iterator.index()));
+            }
+        });
+    }
+
+    @SuppressForbidden(reason = "require usage of Lucene's IOUtils#deleteFilesIgnoringExceptions(...)")
+    private QuantizedRescoreTemp writeQuantizedRescoreTemp(
+        FieldInfo fieldInfo,
+        int vectorCount,
+        CheckedConsumer<QuantizedRescoreRecordWriter, IOException> writeRecords
+    ) throws IOException {
+        final Directory directory = segmentWriteState.segmentInfo.dir;
+        String tempFileName = null;
+        try (IndexOutput temp = directory.createTempOutput(segmentWriteState.segmentInfo.name, "qrec_", IOContext.DEFAULT)) {
+            tempFileName = temp.getName();
+            writeRecords.accept(new QuantizedRescoreRecordWriter(fieldInfo, quantizedRescoreBits, temp));
+        } catch (Throwable t) {
+            if (tempFileName != null) {
+                org.apache.lucene.util.IOUtils.deleteFilesIgnoringExceptions(directory, tempFileName);
+            }
+            throw t;
+        }
+        return new QuantizedRescoreTemp(tempFileName, vectorCount);
+    }
+
+    /**
+     * Writes a field's quantized rescore copy, see {@link QuantizedRescoreMeta}, from the parked records and deletes the
+     * temporary file, returning where the copy is, or {@code null} when the field has no copy. The records are laid out in
+     * the order the posting list writers use, cluster by cluster with each cluster's entries sorted by document id, so a
+     * vector assigned to several clusters gets one record per assignment. The ordinal table written after the records
+     * points each vector at the record of its primary assignment.
+     */
+    @SuppressForbidden(reason = "require usage of Lucene's IOUtils#deleteFilesIgnoringExceptions(...)")
+    private QuantizedRescoreMeta writeQuantizedRescoreCopy(
+        QuantizedRescoreTemp temp,
+        FieldInfo fieldInfo,
+        ClusteringVectorValues<?> vectorValues,
+        int[] assignments,
+        OverspillAssignments overspillAssignments,
+        int numCentroids
+    ) throws IOException {
+        if (temp == null) {
+            return null;
+        }
+        assert assignments.length == temp.vectorCount() : assignments.length + " assignments for " + temp.vectorCount() + " vectors";
+        final Directory directory = segmentWriteState.segmentInfo.dir;
+        try (IndexInput parkedRecords = directory.openInput(temp.fileName(), IOContext.DEFAULT)) {
+            final int recordSize = Math.toIntExact(QuantizedRescoreMeta.recordSize(fieldInfo.getVectorDimension(), quantizedRescoreBits));
+            final byte[] record = new byte[recordSize];
+            final int[] recordIndexByOrdinal = new int[temp.vectorCount()];
+            Arrays.fill(recordIndexByOrdinal, -1);
+            final ClusterAssignmentBuilder clusters = ClusterAssignmentBuilder.build(assignments, overspillAssignments, numCentroids);
+            final int[] entryOrder = new int[clusters.maxPostingListSize()];
+            final long offset = ivfQuantizedRescore.getFilePointer();
+            int recordIndex = 0;
+            for (int c = 0; c < numCentroids; c++) {
+                final int[] cluster = clusters.assignmentsByCluster()[c];
+                for (int j = 0; j < cluster.length; j++) {
+                    entryOrder[j] = j;
+                }
+                new IntSorter(entryOrder, j -> vectorValues.ordToDoc(cluster[j])).sort(0, cluster.length);
+                for (int j = 0; j < cluster.length; j++) {
+                    final int ord = cluster[entryOrder[j]];
+                    if (assignments[ord] == c) {
+                        recordIndexByOrdinal[ord] = recordIndex;
+                    }
+                    parkedRecords.seek((long) ord * recordSize);
+                    parkedRecords.readBytes(record, 0, recordSize);
+                    ivfQuantizedRescore.writeBytes(record, recordSize);
+                    recordIndex++;
+                }
+            }
+            for (int ord = 0; ord < recordIndexByOrdinal.length; ord++) {
+                assert recordIndexByOrdinal[ord] >= 0 : "vector " + ord + " has no primary posting list entry";
+                ivfQuantizedRescore.writeInt(recordIndexByOrdinal[ord]);
+            }
+            return new QuantizedRescoreMeta(quantizedRescoreBits, offset, recordIndex, temp.vectorCount());
+        } finally {
+            org.apache.lucene.util.IOUtils.deleteFilesIgnoringExceptions(directory, temp.fileName());
+        }
+    }
+
+    @SuppressForbidden(reason = "require usage of Lucene's IOUtils#deleteFilesIgnoringExceptions(...)")
+    private void deleteQuantizedRescoreTemp(QuantizedRescoreTemp temp) {
+        if (temp != null) {
+            org.apache.lucene.util.IOUtils.deleteFilesIgnoringExceptions(segmentWriteState.segmentInfo.dir, temp.fileName());
         }
     }
 
@@ -336,13 +519,15 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             Preconditioner preconditioner = createPreconditioner(fieldWriter.fieldInfo().getVectorDimension(), ivfSegmentConfig);
             if (fieldWriter.delegate == null) {
                 // field encoding is not supported, we just write meta information
-                writeMeta(fieldWriter.fieldInfo, 0, 0, 0, 0, 0, null, 0, 0, 0, 0, ivfSegmentConfig, false);
+                writeMeta(fieldWriter.fieldInfo, 0, 0, 0, 0, 0, null, 0, 0, 0, 0, ivfSegmentConfig, false, null);
                 continue;
             }
             // build a float vector values with random access
             final boolean isByte = fieldWriter.fieldInfo.getVectorEncoding() == VectorEncoding.BYTE;
             final ClusteringVectorValues<?> clusteringVectorValues;
+            final QuantizedRescoreTemp rescoreTemp;
             if (isByte) {
+                rescoreTemp = null;
                 @SuppressWarnings("unchecked")
                 final FlatFieldVectorsWriter<byte[]> byteWriter = (FlatFieldVectorsWriter<byte[]>) fieldWriter.delegate;
                 if (preconditioner != null) {
@@ -352,92 +537,111 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             } else {
                 @SuppressWarnings("unchecked")
                 final FlatFieldVectorsWriter<float[]> floatWriter = (FlatFieldVectorsWriter<float[]>) fieldWriter.delegate;
+                rescoreTemp = writeQuantizedRescoreTemp(
+                    fieldWriter.fieldInfo,
+                    getKMeansFloatVectorValues(fieldWriter.fieldInfo, floatWriter, maxDoc, sortMap)
+                );
                 if (preconditioner != null) {
                     preconditioner.preconditionVectorsInPlace(floatWriter.getVectors(), VectorEncoding.FLOAT32);
                 }
                 clusteringVectorValues = getKMeansFloatVectorValues(fieldWriter.fieldInfo, floatWriter, maxDoc, sortMap);
             }
 
-            // build centroids
-            final CentroidInformation<?> centroidAssignments;
-            centroidAssignments = clusteringVectorValues.size() > 0
-                && flatVectorThreshold > 0
-                && clusteringVectorValues.size() <= flatVectorThreshold
-                    ? buildFlatCentroidAssignments(fieldWriter.fieldInfo, clusteringVectorValues)
-                    : calculateCentroids(fieldWriter.fieldInfo, clusteringVectorValues);
+            try {
+                // build centroids
+                final CentroidInformation<?> centroidAssignments;
+                centroidAssignments = clusteringVectorValues.size() > 0
+                    && flatVectorThreshold > 0
+                    && clusteringVectorValues.size() <= flatVectorThreshold
+                        ? buildFlatCentroidAssignments(fieldWriter.fieldInfo, clusteringVectorValues)
+                        : calculateCentroids(fieldWriter.fieldInfo, clusteringVectorValues);
 
-            final CentroidOffsetAndLength centroidOffsetAndLength;
-            final CentroidSupplier centroidSupplier;
-            final long centroidOffset;
-            final CI centroidIndex;
-            final long postingListOffset;
-            final long postingListLength;
-            final float[] globalCentroid = centroidAssignments.globalCentroid();
+                final CentroidOffsetAndLength centroidOffsetAndLength;
+                final CentroidSupplier centroidSupplier;
+                final long centroidOffset;
+                final CI centroidIndex;
+                final long postingListOffset;
+                final long postingListLength;
+                final float[] globalCentroid = centroidAssignments.globalCentroid();
 
-            if (supportsByteNative() && centroidAssignments.centroids() instanceof byte[][] byteCentroidArrays) {
-                centroidSupplier = createCentroidSupplier(fieldWriter.fieldInfo, byteCentroidArrays, globalCentroid);
-            } else {
-                @SuppressWarnings("unchecked")
-                CentroidInformation<float[]> floatCentroidInfo = (CentroidInformation<float[]>) centroidAssignments;
-                centroidSupplier = createCentroidSupplier(fieldWriter.fieldInfo, floatCentroidInfo.centroids(), globalCentroid);
+                if (supportsByteNative() && centroidAssignments.centroids() instanceof byte[][] byteCentroidArrays) {
+                    centroidSupplier = createCentroidSupplier(fieldWriter.fieldInfo, byteCentroidArrays, globalCentroid);
+                } else {
+                    @SuppressWarnings("unchecked")
+                    CentroidInformation<float[]> floatCentroidInfo = (CentroidInformation<float[]>) centroidAssignments;
+                    centroidSupplier = createCentroidSupplier(fieldWriter.fieldInfo, floatCentroidInfo.centroids(), globalCentroid);
+                }
+                centroidOffset = ivfCentroids.alignFilePointer(Float.BYTES);
+                // write initial centroid index (we might need to read it later for overspilling)
+                centroidIndex = writeCentroidIndex(centroidSupplier, centroidAssignments.assignments(), ivfCentroids);
+                postingListOffset = ivfClusters.alignFilePointer(Float.BYTES);
+
+                // For byte fields with float centroids (e.g. flat threshold), widen byte vectors to float
+                final ClusteringVectorValues<?> postingsVectorValues;
+                if (clusteringVectorValues instanceof ByteVectorValues && centroidSupplier.byteCentroid(0) == null) {
+                    postingsVectorValues = asFloatVectorValues(fieldWriter.fieldInfo, clusteringVectorValues);
+                } else {
+                    postingsVectorValues = clusteringVectorValues;
+                }
+
+                // write posting lists
+                centroidOffsetAndLength = buildAndWritePostingsLists(
+                    fieldWriter.fieldInfo,
+                    centroidSupplier,
+                    postingsVectorValues,
+                    ivfClusters,
+                    postingListOffset,
+                    centroidAssignments.assignments(),
+                    centroidAssignments.overspillAssignments(),
+                    ivfSegmentConfig
+                );
+                postingListLength = ivfClusters.getFilePointer() - postingListOffset;
+
+                final QuantizedRescoreMeta rescoreMeta = writeQuantizedRescoreCopy(
+                    rescoreTemp,
+                    fieldWriter.fieldInfo,
+                    clusteringVectorValues,
+                    centroidAssignments.assignments(),
+                    centroidAssignments.overspillAssignments(),
+                    centroidSupplier.size()
+                );
+
+                // write the rest of the centroid data now we know the size of the postings
+                writeCentroidData(
+                    fieldWriter.fieldInfo,
+                    centroidSupplier,
+                    globalCentroid,
+                    centroidOffsetAndLength,
+                    centroidIndex,
+                    ivfCentroids
+                );
+                final long centroidLength = ivfCentroids.getFilePointer() - centroidOffset;
+
+                long preconditionerOffset = ivfCentroids.getFilePointer();
+                writePreconditioner(preconditioner, ivfCentroids);
+                long preconditionerLength = ivfCentroids.getFilePointer() - preconditionerOffset;
+
+                // write meta file
+                writeMeta(
+                    fieldWriter.fieldInfo,
+                    centroidSupplier.size(),
+                    centroidOffset,
+                    centroidLength,
+                    postingListOffset,
+                    postingListLength,
+                    globalCentroid,
+                    preconditionerOffset,
+                    preconditionerLength,
+                    0,
+                    0,
+                    ivfSegmentConfig,
+                    supportsByteNative() && centroidAssignments.centroids() instanceof byte[][],
+                    rescoreMeta
+                );
+            } catch (Throwable t) {
+                deleteQuantizedRescoreTemp(rescoreTemp);
+                throw t;
             }
-            centroidOffset = ivfCentroids.alignFilePointer(Float.BYTES);
-            // write initial centroid index (we might need to read it later for overspilling)
-            centroidIndex = writeCentroidIndex(centroidSupplier, centroidAssignments.assignments(), ivfCentroids);
-            postingListOffset = ivfClusters.alignFilePointer(Float.BYTES);
-
-            // For byte fields with float centroids (e.g. flat threshold), widen byte vectors to float
-            final ClusteringVectorValues<?> postingsVectorValues;
-            if (clusteringVectorValues instanceof ByteVectorValues && centroidSupplier.byteCentroid(0) == null) {
-                postingsVectorValues = asFloatVectorValues(fieldWriter.fieldInfo, clusteringVectorValues);
-            } else {
-                postingsVectorValues = clusteringVectorValues;
-            }
-
-            // write posting lists
-            centroidOffsetAndLength = buildAndWritePostingsLists(
-                fieldWriter.fieldInfo,
-                centroidSupplier,
-                postingsVectorValues,
-                ivfClusters,
-                postingListOffset,
-                centroidAssignments.assignments(),
-                centroidAssignments.overspillAssignments(),
-                ivfSegmentConfig
-            );
-            postingListLength = ivfClusters.getFilePointer() - postingListOffset;
-
-            // write the rest of the centroid data now we know the size of the postings
-            writeCentroidData(
-                fieldWriter.fieldInfo,
-                centroidSupplier,
-                globalCentroid,
-                centroidOffsetAndLength,
-                centroidIndex,
-                ivfCentroids
-            );
-            final long centroidLength = ivfCentroids.getFilePointer() - centroidOffset;
-
-            long preconditionerOffset = ivfCentroids.getFilePointer();
-            writePreconditioner(preconditioner, ivfCentroids);
-            long preconditionerLength = ivfCentroids.getFilePointer() - preconditionerOffset;
-
-            // write meta file
-            writeMeta(
-                fieldWriter.fieldInfo,
-                centroidSupplier.size(),
-                centroidOffset,
-                centroidLength,
-                postingListOffset,
-                postingListLength,
-                globalCentroid,
-                preconditionerOffset,
-                preconditionerLength,
-                0,
-                0,
-                ivfSegmentConfig,
-                supportsByteNative() && centroidAssignments.centroids() instanceof byte[][]
-            );
         }
     }
 
@@ -617,7 +821,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             mergeOneFieldIVF(fieldInfo, mergeState, resolvedConfig);
         } else {
             // we simply write information that the field is present but we don't do anything with it.
-            writeMeta(fieldInfo, 0, 0, 0, 0, 0, null, 0, 0, 0, 0, IvfSegmentConfig.NONE, false);
+            writeMeta(fieldInfo, 0, 0, 0, 0, 0, null, 0, 0, 0, 0, IvfSegmentConfig.NONE, false, null);
         }
         // we merge the vectors at the end so we only have two copies of the vectors on disk at the same time.
         rawVectorDelegate.mergeOneField(fieldInfo, mergeState);
@@ -637,7 +841,8 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         int numberOfSlices,
         int maxSliceSize,
         IvfSegmentConfig ivfSegmentConfig,
-        boolean byteCentroids
+        boolean byteCentroids,
+        QuantizedRescoreMeta rescoreMeta
     ) throws IOException {
         ivfMeta.writeInt(field.number);
         ivfMeta.writeString(rawVectorFormatName);
@@ -662,6 +867,9 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             buffer.asFloatBuffer().put(globalCentroid);
             ivfMeta.writeBytes(buffer.array(), buffer.array().length);
             ivfMeta.writeInt(Float.floatToIntBits(ESVectorUtil.dotProduct(globalCentroid, globalCentroid)));
+        }
+        if (ivfQuantizedRescore != null) {
+            QuantizedRescoreMeta.write(ivfMeta, rescoreMeta);
         }
         doWriteMeta(
             ivfMeta,
@@ -745,7 +953,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         }
         if (numVectors == 0) {
             long centroidOffset = ivfCentroids.getFilePointer();
-            writeMeta(fieldInfo, 0, centroidOffset, 0, 0, 0, null, 0, 0, 0, 0, ivfSegmentConfig, false);
+            writeMeta(fieldInfo, 0, centroidOffset, 0, 0, 0, null, 0, 0, 0, 0, ivfSegmentConfig, false, null);
             return;
         }
         // now open the temp file and build the index structures. It is expected these files to be read in sequential order.
@@ -814,7 +1022,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             try {
                 if (assignments.numCentroids() == 0) {
                     centroidOffset = ivfCentroids.getFilePointer();
-                    writeMeta(fieldInfo, 0, centroidOffset, 0, 0, 0, null, 0, 0, 0, 0, ivfSegmentConfig, false);
+                    writeMeta(fieldInfo, 0, centroidOffset, 0, 0, 0, null, 0, 0, 0, 0, ivfSegmentConfig, false, null);
                     CodecUtil.writeFooter(centroidTemp);
                     IOUtils.close(centroidTemp);
                     return;
@@ -834,18 +1042,35 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
 
                     // write posting lists
                     postingListOffset = ivfClusters.alignFilePointer(Float.BYTES);
-                    centroidOffsetAndLength = buildAndWritePostingsLists(
-                        fieldInfo,
-                        centroidSupplier,
-                        vectorValues,
-                        ivfClusters,
-                        postingListOffset,
-                        mergeState,
-                        assignments.assignments(),
-                        assignments.overspillAssignments(),
-                        ivfSegmentConfig
-                    );
-                    postingListLength = ivfClusters.getFilePointer() - postingListOffset;
+                    final QuantizedRescoreTemp rescoreTemp = isByte
+                        ? null
+                        : writeQuantizedRescoreTemp(fieldInfo, MergedVectorValues.mergeFloatVectorValues(fieldInfo, mergeState));
+                    final QuantizedRescoreMeta rescoreMeta;
+                    try {
+                        centroidOffsetAndLength = buildAndWritePostingsLists(
+                            fieldInfo,
+                            centroidSupplier,
+                            vectorValues,
+                            ivfClusters,
+                            postingListOffset,
+                            mergeState,
+                            assignments.assignments(),
+                            assignments.overspillAssignments(),
+                            ivfSegmentConfig
+                        );
+                        postingListLength = ivfClusters.getFilePointer() - postingListOffset;
+                        rescoreMeta = writeQuantizedRescoreCopy(
+                            rescoreTemp,
+                            fieldInfo,
+                            vectorValues,
+                            assignments.assignments(),
+                            assignments.overspillAssignments(),
+                            centroidSupplier.size()
+                        );
+                    } catch (Throwable t) {
+                        deleteQuantizedRescoreTemp(rescoreTemp);
+                        throw t;
+                    }
 
                     // write the rest of the centroid data now we know the size of the postings
                     writeCentroidData(
@@ -877,7 +1102,8 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
                         assignments.centroidSlices() == null ? 0 : assignments.centroidSlices().sliceOffsets().length,
                         assignments.centroidSlices() == null ? 0 : assignments.centroidSlices().maxSliceSize(),
                         ivfSegmentConfig,
-                        byteCentroidsWritten && byteVectorValues != null
+                        byteCentroidsWritten && byteVectorValues != null,
+                        rescoreMeta
                     );
                 }
             } finally {
@@ -978,11 +1204,14 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         if (ivfClusters != null) {
             CodecUtil.writeFooter(ivfClusters);
         }
+        if (ivfQuantizedRescore != null) {
+            CodecUtil.writeFooter(ivfQuantizedRescore);
+        }
     }
 
     @Override
     public final void close() throws IOException {
-        IOUtils.close(rawVectorDelegate, ivfMeta, ivfCentroids, ivfClusters);
+        IOUtils.close(rawVectorDelegate, ivfMeta, ivfCentroids, ivfClusters, ivfQuantizedRescore);
     }
 
     @Override

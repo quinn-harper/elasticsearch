@@ -126,7 +126,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         int flatVectorThreshold,
         String sliceField,
         IvfFlushConfigSource flushConfigSource,
-        IvfMergeConfigResolver mergeConfigResolver
+        IvfMergeConfigResolver mergeConfigResolver,
+        int quantizedRescoreBits
     ) throws IOException {
         super(
             state,
@@ -141,7 +142,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             true,
             flatVectorThreshold,
             onDiskMerge,
-            true
+            true,
+            ESNextDiskBBQVectorsFormat.QUANTIZED_RESCORE_EXTENSION,
+            quantizedRescoreBits
         );
         this.vectorPerCluster = vectorPerCluster;
         this.centroidIndexFormat = centroidIndexFormat;

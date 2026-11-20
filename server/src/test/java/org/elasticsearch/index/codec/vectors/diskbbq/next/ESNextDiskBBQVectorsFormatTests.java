@@ -22,9 +22,11 @@ import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NoMergePolicy;
@@ -45,6 +47,7 @@ import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopDocsCollector;
 import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.TestUtil;
@@ -52,7 +55,11 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.index.codec.vectors.ESBaseKnnVectorsFormatTestCase;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoreMeta;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescorer;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
 import org.elasticsearch.search.vectors.ESAcceptDocs.SliceAcceptDocs;
@@ -85,6 +92,7 @@ import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.oneOf;
 
 public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestCase {
@@ -185,7 +193,7 @@ public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestC
             }
             var offHeap = knnVectorsReader.getOffHeapByteSize(fieldInfo);
             long totalByteSize = offHeap.values().stream().mapToLong(Long::longValue).sum();
-            assertThat(offHeap, aMapWithSize(3));
+            assertThat(offHeap, aMapWithSize(4));
             assertThat(totalByteSize, greaterThanOrEqualTo(0L));
         } else {
             throw new AssertionError("unexpected:" + r.getClass());
@@ -204,7 +212,8 @@ public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestC
                 return new ESNextDiskBBQVectorsFormat(128, 4, null);
             }
         };
-        String expectedPattern = "ESNextDiskBBQVectorsFormat(vectorPerCluster=128, mergeExec=false, sliceField=null)";
+        String expectedPattern =
+            "ESNextDiskBBQVectorsFormat(vectorPerCluster=128, mergeExec=false, sliceField=null, quantizedRescoreBits=8)";
 
         var defaultScorer = format(Locale.ROOT, expectedPattern, "DefaultFlatVectorScorer");
         var memSegScorer = format(Locale.ROOT, expectedPattern, "Lucene99MemorySegmentFlatVectorsScorer");
@@ -234,10 +243,148 @@ public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestC
                     }
                     var fieldInfo = r.getFieldInfos().fieldInfo("f");
                     var offHeap = knnVectorsReader.getOffHeapByteSize(fieldInfo);
-                    assertThat(offHeap, aMapWithSize(3));
+                    assertThat(offHeap, aMapWithSize(4));
                 }
             }
         }
+    }
+
+    /**
+     * The quantized rescore copy must score every vector of a segment within the quantization error of its width against
+     * the exact similarity, through flushed segments and through a merge, since the merged copy is rebuilt from the merged
+     * raw vectors.
+     */
+    public void testQuantizedRescorerMatchesExactSimilarity() throws IOException {
+        int dimensions = random().nextInt(16, 300);
+        int numDocs = random().nextInt(200, 1000);
+        int bits = randomFrom(2, 4, 8);
+        VectorSimilarityFunction similarity = randomSimilarity();
+        IndexWriterConfig config = newIndexWriterConfig().setCodec(TestUtil.alwaysKnnVectorsFormat(quantizedRescoreFormat(bits)));
+        try (Directory dir = newDirectory(); IndexWriter w = new IndexWriter(dir, config)) {
+            for (int i = 0; i < numDocs; i++) {
+                Document doc = new Document();
+                doc.add(new KnnFloatVectorField("f", randomVector(dimensions), similarity));
+                w.addDocument(doc);
+                if (i == numDocs / 2) {
+                    w.commit();
+                }
+            }
+            w.commit();
+            if (random().nextBoolean()) {
+                w.forceMerge(1);
+            }
+            try (IndexReader reader = DirectoryReader.open(w)) {
+                float[] query = randomVector(dimensions);
+                for (LeafReaderContext context : reader.leaves()) {
+                    LeafReader leaf = context.reader();
+                    QuantizedRescorer rescorer = ivfReader(leaf, "f").quantizedRescorer("f", query);
+                    assertNotNull(rescorer);
+                    FloatVectorValues exactValues = leaf.getFloatVectorValues("f");
+                    KnnVectorValues.DocIndexIterator exactIterator = exactValues.iterator();
+                    VectorScorer scorer = rescorer.scorer();
+                    DocIdSetIterator scoredDocs = scorer.iterator();
+                    double totalError = 0;
+                    int scored = 0;
+                    Set<Integer> seenRecords = new HashSet<>();
+                    for (int doc = exactIterator.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = exactIterator.nextDoc()) {
+                        assertEquals(doc, scoredDocs.advance(doc));
+                        float expected = similarity.compare(query, exactValues.vectorValue(exactIterator.index()));
+                        float actual = scorer.score();
+                        assertEquals("doc " + doc + " at " + bits + " bits", expected, actual, maxErrorPerVector(bits));
+                        int recordIndex = rescorer.recordIndex(exactIterator.index());
+                        assertTrue("record " + recordIndex + " is used by two vectors", seenRecords.add(recordIndex));
+                        rescorer.prefetchRecord(recordIndex);
+                        assertEquals("record score of doc " + doc, actual, rescorer.scoreRecord(recordIndex), 0f);
+                        totalError += Math.abs(expected - actual);
+                        scored++;
+                    }
+                    assertEquals(leaf.numDocs(), scored);
+                    assertThat("mean error at " + bits + " bits", totalError / scored, lessThan(maxMeanError(bits)));
+                }
+            }
+        }
+    }
+
+    private static float maxErrorPerVector(int bits) {
+        return switch (bits) {
+            case 8 -> 0.01f;
+            case 4 -> 0.05f;
+            case 2 -> 0.2f;
+            default -> throw new AssertionError("unexpected quantized rescore width " + bits);
+        };
+    }
+
+    private static double maxMeanError(int bits) {
+        return switch (bits) {
+            case 8 -> 0.002;
+            case 4 -> 0.01;
+            case 2 -> 0.05;
+            default -> throw new AssertionError("unexpected quantized rescore width " + bits);
+        };
+    }
+
+    /**
+     * Without the option the segment stores no copy, reports none off heap, and offers no rescorer. With it the copy holds
+     * at least one record per vector (more when overspill duplicates a vector into a second posting list) plus the ordinal table.
+     */
+    public void testQuantizedRescoreCanBeDisabled() throws IOException {
+        int dimensions = random().nextInt(16, 128);
+        for (int bits : new int[] { 0, 2, 4, 8 }) {
+            IndexWriterConfig config = newIndexWriterConfig().setCodec(TestUtil.alwaysKnnVectorsFormat(quantizedRescoreFormat(bits)));
+            try (Directory dir = newDirectory(); IndexWriter w = new IndexWriter(dir, config)) {
+                for (int i = 0; i < 50; i++) {
+                    Document doc = new Document();
+                    doc.add(new KnnFloatVectorField("f", randomVector(dimensions), VectorSimilarityFunction.DOT_PRODUCT));
+                    w.addDocument(doc);
+                }
+                w.commit();
+                try (IndexReader reader = DirectoryReader.open(w)) {
+                    LeafReader leaf = getOnlyLeafReader(reader);
+                    IVFVectorsReader<?> ivfReader = ivfReader(leaf, "f");
+                    long copySize = ivfReader.getOffHeapByteSize(leaf.getFieldInfos().fieldInfo("f"))
+                        .get(ESNextDiskBBQVectorsFormat.QUANTIZED_RESCORE_EXTENSION);
+                    QuantizedRescorer rescorer = ivfReader.quantizedRescorer("f", randomVector(dimensions));
+                    if (bits != 0) {
+                        long recordSize = QuantizedRescoreMeta.recordSize(dimensions, bits);
+                        long tableSize = 50L * Integer.BYTES;
+                        assertThat(copySize, greaterThanOrEqualTo(50 * recordSize + tableSize));
+                        assertEquals("records must fill the copy up to the ordinal table", 0L, (copySize - tableSize) % recordSize);
+                        assertNotNull(rescorer);
+                    } else {
+                        assertEquals(0L, copySize);
+                        assertNull(rescorer);
+                    }
+                }
+            }
+        }
+    }
+
+    private static ESNextDiskBBQVectorsFormat quantizedRescoreFormat(int quantizedRescoreBits) {
+        return new ESNextDiskBBQVectorsFormat(
+            randomFrom(QuantEncoding.values()),
+            random().nextInt(MIN_VECTORS_PER_CLUSTER, 2 * MIN_VECTORS_PER_CLUSTER),
+            random().nextInt(MIN_CENTROIDS_PER_PARENT_CLUSTER, 8),
+            DenseVectorFieldMapper.ElementType.FLOAT,
+            false,
+            null,
+            1,
+            random().nextBoolean(),
+            DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+            0,
+            null,
+            IvfFlushConfigSource.empty(),
+            IvfMergeConfigResolver.useCodecDefault(),
+            false,
+            quantizedRescoreBits
+        );
+    }
+
+    private static IVFVectorsReader<?> ivfReader(LeafReader leaf, String field) {
+        KnnVectorsReader knnVectorsReader = ((CodecReader) leaf).getVectorReader();
+        if (knnVectorsReader instanceof PerFieldKnnVectorsFormat.FieldsReader fieldsReader) {
+            knnVectorsReader = fieldsReader.getFieldReader(field);
+        }
+        return (IVFVectorsReader<?>) knnVectorsReader;
     }
 
     public void testFewVectorManyTimes() throws IOException {

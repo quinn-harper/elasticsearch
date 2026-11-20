@@ -77,6 +77,7 @@ public record TestConfiguration(
     int forceMergeMaxNumSegments,
     boolean onDiskRescore,
     boolean onDiskMerge,
+    Integer quantizedRescoreBits,
     List<SearchParameters> searchParams,
     int numMergeWorkers,
     int numQuantizerWorkers,
@@ -135,6 +136,7 @@ public record TestConfiguration(
     static final ParseField WRITER_BUFFER_DOCS_FIELD = new ParseField("writer_buffer_docs");
     static final ParseField ON_DISK_RESCORE_FIELD = new ParseField("on_disk_rescore");
     static final ParseField ON_DISK_MERGE_FIELD = new ParseField("on_disk_merge");
+    static final ParseField QUANTIZED_RESCORE_BITS_FIELD = new ParseField("quantized_rescore_bits");
     static final ParseField DO_PRECONDITION = new ParseField("precondition");
     static final ParseField PRECONDITIONING_BLOCK_DIMS = new ParseField("preconditioning_block_dims");
     static final ParseField FILTER_CACHED = new ParseField("filter_cache");
@@ -214,6 +216,7 @@ public record TestConfiguration(
         PARSER.declareInt(Builder::setForceMergeMaxNumSegments, FORCE_MERGE_MAX_NUM_SEGMENTS_FIELD);
         PARSER.declareBoolean(Builder::setOnDiskRescore, ON_DISK_RESCORE_FIELD);
         PARSER.declareBoolean(Builder::setOnDiskMerge, ON_DISK_MERGE_FIELD);
+        PARSER.declareInt(Builder::setQuantizedRescoreBits, QUANTIZED_RESCORE_BITS_FIELD);
         PARSER.declareBoolean(Builder::setDoPrecondition, DO_PRECONDITION);
         PARSER.declareInt(Builder::setPreconditioningBlockDims, PRECONDITIONING_BLOCK_DIMS);
         PARSER.declareFieldArray(Builder::setFilterCached, (p, c) -> p.booleanValue(), FILTER_CACHED, ObjectParser.ValueType.VALUE_ARRAY);
@@ -305,6 +308,12 @@ public record TestConfiguration(
             new ParameterHelp("writer_buffer_docs", "int", "Max buffered docs before flush; -1 disables auto flush by docs."),
             new ParameterHelp("on_disk_rescore", "boolean", "Search: enable on-disk rescore for search."),
             new ParameterHelp("on_disk_merge", "boolean", "GPU HNSW bbq: read the source raw vectors with direct I/O on merge."),
+            new ParameterHelp(
+                "quantized_rescore_bits",
+                "int",
+                "IVF: keep a quantized copy of each vector at 2, 4 or 8 bits per dimension that the rescore pass reads instead of "
+                    + "the raw vectors; absent rescores from the raw vectors."
+            ),
             new ParameterHelp("precondition", "boolean", "IVF: apply preconditioning prior to indexing."),
             new ParameterHelp("preconditioning_block_dims", "int", "IVF: block dimensions used for preconditioning."),
             new ParameterHelp(
@@ -485,6 +494,7 @@ public record TestConfiguration(
         private double writerBufferSizeInMb = DEFAULT_WRITER_BUFFER_MB;
         private boolean onDiskRescore = false;
         private boolean onDiskMerge = false;
+        private Integer quantizedRescoreBits = null;
         private boolean doPrecondition = false;
         private int preconditioningBlockDims = 64;
         private List<Boolean> filterCached = List.of(Boolean.TRUE);
@@ -701,6 +711,11 @@ public record TestConfiguration(
 
         public Builder setOnDiskMerge(boolean onDiskMerge) {
             this.onDiskMerge = onDiskMerge;
+            return this;
+        }
+
+        public Builder setQuantizedRescoreBits(int quantizedRescoreBits) {
+            this.quantizedRescoreBits = quantizedRescoreBits;
             return this;
         }
 
@@ -988,6 +1003,14 @@ public record TestConfiguration(
             if (autoCalibrationProfile != IvfAutoCalibrationProfile.DISABLED && indexType != KnnIndexTester.IndexType.IVF) {
                 throw new IllegalArgumentException("auto_calibrate is only supported when index_type is ivf");
             }
+            if (quantizedRescoreBits != null) {
+                if (indexType != KnnIndexTester.IndexType.IVF) {
+                    throw new IllegalArgumentException("quantized_rescore_bits only applies when index_type is ivf");
+                }
+                if (quantizedRescoreBits != 2 && quantizedRescoreBits != 4 && quantizedRescoreBits != 8) {
+                    throw new IllegalArgumentException("quantized_rescore_bits must be 2, 4 or 8, got: " + quantizedRescoreBits);
+                }
+            }
             if (exactQuantized.contains(Boolean.TRUE) && quantizeBits == null && indexType != KnnIndexTester.IndexType.IVF) {
                 throw new IllegalArgumentException("exact_quantized requires a quantized index; set quantize_bits or use index_type: ivf");
             }
@@ -1063,6 +1086,7 @@ public record TestConfiguration(
                 forceMergeMaxNumSegments,
                 onDiskRescore,
                 onDiskMerge,
+                quantizedRescoreBits,
                 searchRuns,
                 numMergeWorkers,
                 numQuantizerWorkers,
@@ -1132,6 +1156,9 @@ public record TestConfiguration(
             builder.field(FORCE_MERGE_MAX_NUM_SEGMENTS_FIELD.getPreferredName(), forceMergeMaxNumSegments);
             builder.field(ON_DISK_RESCORE_FIELD.getPreferredName(), onDiskRescore);
             builder.field(ON_DISK_MERGE_FIELD.getPreferredName(), onDiskMerge);
+            if (quantizedRescoreBits != null) {
+                builder.field(QUANTIZED_RESCORE_BITS_FIELD.getPreferredName(), quantizedRescoreBits);
+            }
             builder.field(FILTER_CACHED.getPreferredName(), filterCached);
             if (mergePolicy != null) {
                 builder.field(MERGE_POLICY_FIELD.getPreferredName(), mergePolicy.name().toLowerCase(Locale.ROOT));

@@ -38,8 +38,13 @@ import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.common.lucene.search.Queries;
 import org.elasticsearch.index.codec.bwc.Elasticsearch93Lucene104Codec;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
+import org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat;
 import org.elasticsearch.index.codec.vectors.es93.ES93HnswScalarQuantizedVectorsFormat;
 import org.elasticsearch.index.codec.zstd.Zstd814StoredFieldsFormat;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
@@ -121,6 +126,78 @@ public class RescoreKnnVectorQueryTests extends ESTestCase {
                     }
 
                     assertScoresMatchGroundTruth(queryVector, searcher, rescoredDocs, numDocs);
+                }
+            }
+        }
+    }
+
+    /**
+     * A segment written with a quantized rescore copy is rescored from that copy, so the scores land within the 7-bit
+     * quantization error of the exact similarity rather than matching it to the last bit.
+     */
+    public void testRescoreFromQuantizedCopy() throws Exception {
+        int numDocs = randomIntBetween(100, 300);
+        int numDims = randomIntBetween(16, 128);
+        int k = randomIntBetween(5, 20);
+        float[] queryVector = VectorUtil.l2normalize(randomFloatVector(numDims));
+
+        KnnVectorsFormat format = new ESNextDiskBBQVectorsFormat(
+            randomFrom(QuantEncoding.values()),
+            ESNextDiskBBQVectorsFormat.MIN_VECTORS_PER_CLUSTER,
+            ESNextDiskBBQVectorsFormat.DEFAULT_CENTROIDS_PER_PARENT_CLUSTER,
+            DenseVectorFieldMapper.ElementType.FLOAT,
+            false,
+            null,
+            1,
+            false,
+            ESNextDiskBBQVectorsFormat.DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+            0,
+            null,
+            IvfFlushConfigSource.empty(),
+            IvfMergeConfigResolver.useCodecDefault(),
+            false,
+            true
+        );
+        IndexWriterConfig iwc = new IndexWriterConfig();
+        iwc.setCodec(new Elasticsearch93Lucene104Codec(randomFrom(Zstd814StoredFieldsFormat.Mode.values())) {
+            @Override
+            public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                return format;
+            }
+        });
+        try (Directory d = newDirectory()) {
+            try (IndexWriter w = new IndexWriter(d, iwc)) {
+                for (int i = 0; i < numDocs; i++) {
+                    Document document = new Document();
+                    float[] vector = VectorUtil.l2normalize(randomFloatVector(numDims));
+                    document.add(new KnnFloatVectorField(FIELD_NAME, vector, VectorSimilarityFunction.DOT_PRODUCT));
+                    w.addDocument(document);
+                }
+                w.commit();
+                w.forceMerge(1);
+            }
+            try (IndexReader reader = DirectoryReader.open(d)) {
+                IndexSearcher searcher = newSearcher(reader, true, false);
+                RescoreKnnVectorQuery rescoreQuery = RescoreKnnVectorQuery.fromInnerQuery(
+                    FIELD_NAME,
+                    queryVector,
+                    k,
+                    k,
+                    Queries.ALL_DOCS_INSTANCE
+                );
+                TopDocs rescoredDocs = searcher.search(rescoreQuery, numDocs);
+                assertThat(rescoredDocs.scoreDocs, arrayWithSize(k));
+
+                LeafReader leaf = reader.leaves().get(0).reader();
+                FloatVectorValues values = leaf.getFloatVectorValues(FIELD_NAME);
+                var iterator = values.iterator();
+                float previous = Float.POSITIVE_INFINITY;
+                for (ScoreDoc scoreDoc : rescoredDocs.scoreDocs) {
+                    assertEquals(scoreDoc.doc, iterator.advance(scoreDoc.doc));
+                    float exact = VectorSimilarityFunction.DOT_PRODUCT.compare(queryVector, values.vectorValue(iterator.index()));
+                    assertThat("doc " + scoreDoc.doc, (double) scoreDoc.score, closeTo(exact, 0.01));
+                    assertTrue("scores must be sorted", scoreDoc.score <= previous);
+                    previous = scoreDoc.score;
                 }
             }
         }

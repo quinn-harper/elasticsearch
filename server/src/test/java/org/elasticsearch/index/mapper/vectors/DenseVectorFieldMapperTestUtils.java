@@ -143,6 +143,7 @@ public class DenseVectorFieldMapperTestUtils {
                 experimentalFeaturesEnabled,
                 null,
                 DenseVectorFieldMapper.BBQIVFIndexOptions.QuantizationType.OSQ,
+                false,
                 false
             );
         }

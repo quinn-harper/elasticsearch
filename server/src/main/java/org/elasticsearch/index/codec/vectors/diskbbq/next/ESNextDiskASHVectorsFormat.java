@@ -20,6 +20,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.AshConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
+import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedRescoreMeta;
 import org.elasticsearch.index.codec.vectors.es93.DirectIOCapableLucene99FlatVectorsFormat;
 import org.elasticsearch.index.codec.vectors.es93.ES93BFloat16FlatVectorsFormat;
 import org.elasticsearch.index.codec.vectors.es93.ES93GenericFlatVectorScorer;
@@ -46,12 +47,16 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
     public static final String NAME = "ESNextDiskASHVectorsFormat";
     public static final String CENTROID_EXTENSION = "cenivf";
     public static final String CLUSTER_EXTENSION = "clivf";
+    /** The 7-bit copy of each vector used to rescore candidates, in flat vector ordinal order, in a file of its own. */
+    public static final String QUANTIZED_RESCORE_EXTENSION = "qivf";
     public static final String IVF_META_EXTENSION = "mivf";
 
     public static final int VERSION_START = 1;
     public static final int VERSION_DIRECT_IO = VERSION_START;
     public static final int VERSION_ON_DISK_MERGE = VERSION_START;
-    public static final int VERSION_CURRENT = VERSION_START;
+    /** Segments carry the quantized rescore file and the field meta says where each field's copy is. */
+    public static final int VERSION_QUANTIZED_RESCORE = 2;
+    public static final int VERSION_CURRENT = VERSION_QUANTIZED_RESCORE;
     public static final float DYNAMIC_VISIT_RATIO = 0.0f;
 
     private static final DirectIOCapableFlatVectorsFormat float32VectorFormat = new DirectIOCapableLucene99FlatVectorsFormat(
@@ -99,6 +104,7 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
     private final String sliceField;
     private final IvfFlushConfigSource ivfFlushConfigSource;
     private final IvfMergeConfigResolver ivfMergeConfigResolver;
+    private final int quantizedRescoreBits;
 
     /**
      * No-arg constructor for SPI. Segments describe their own configuration, so this only matters for writing, where it
@@ -159,6 +165,83 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
         IvfMergeConfigResolver ivfMergeConfigResolver,
         boolean onDiskMerge
     ) {
+        this(
+            ashConfigResolver,
+            vectorPerCluster,
+            centroidsPerParentCluster,
+            elementType,
+            useDirectIO,
+            mergingExecutorService,
+            maxMergingWorkers,
+            quantizerExecutorService,
+            flatVectorThreshold,
+            sliceField,
+            ivfFlushConfigSource,
+            ivfMergeConfigResolver,
+            onDiskMerge,
+            true
+        );
+    }
+
+    /**
+     * @param quantizedRescore whether fields keep a quantized copy of each vector at {@link QuantizedRescoreMeta#DEFAULT_BITS}
+     *                         bits that the rescore query reads instead of the raw vectors
+     */
+    public ESNextDiskASHVectorsFormat(
+        AshConfigResolver ashConfigResolver,
+        int vectorPerCluster,
+        int centroidsPerParentCluster,
+        DenseVectorFieldMapper.ElementType elementType,
+        boolean useDirectIO,
+        ExecutorService mergingExecutorService,
+        int maxMergingWorkers,
+        ExecutorService quantizerExecutorService,
+        int flatVectorThreshold,
+        String sliceField,
+        IvfFlushConfigSource ivfFlushConfigSource,
+        IvfMergeConfigResolver ivfMergeConfigResolver,
+        boolean onDiskMerge,
+        boolean quantizedRescore
+    ) {
+        this(
+            ashConfigResolver,
+            vectorPerCluster,
+            centroidsPerParentCluster,
+            elementType,
+            useDirectIO,
+            mergingExecutorService,
+            maxMergingWorkers,
+            quantizerExecutorService,
+            flatVectorThreshold,
+            sliceField,
+            ivfFlushConfigSource,
+            ivfMergeConfigResolver,
+            onDiskMerge,
+            quantizedRescore ? QuantizedRescoreMeta.DEFAULT_BITS : 0
+        );
+    }
+
+    /**
+     * @param quantizedRescoreBits bits per dimension of the quantized copy of each vector that fields keep for the rescore
+     *                             query to read instead of the raw vectors, one of {@link QuantizedRescoreMeta#SUPPORTED_BITS},
+     *                             or 0 for no copy. Segments written without a copy are rescored from the raw vectors.
+     */
+    public ESNextDiskASHVectorsFormat(
+        AshConfigResolver ashConfigResolver,
+        int vectorPerCluster,
+        int centroidsPerParentCluster,
+        DenseVectorFieldMapper.ElementType elementType,
+        boolean useDirectIO,
+        ExecutorService mergingExecutorService,
+        int maxMergingWorkers,
+        ExecutorService quantizerExecutorService,
+        int flatVectorThreshold,
+        String sliceField,
+        IvfFlushConfigSource ivfFlushConfigSource,
+        IvfMergeConfigResolver ivfMergeConfigResolver,
+        boolean onDiskMerge,
+        int quantizedRescoreBits
+    ) {
         super(NAME);
         if (vectorPerCluster < MIN_VECTORS_PER_CLUSTER || vectorPerCluster > MAX_VECTORS_PER_CLUSTER) {
             throw new IllegalArgumentException(
@@ -202,6 +285,7 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
         this.sliceField = sliceField;
         this.ivfFlushConfigSource = ivfFlushConfigSource;
         this.ivfMergeConfigResolver = ivfMergeConfigResolver;
+        this.quantizedRescoreBits = quantizedRescoreBits == 0 ? 0 : QuantizedRescoreMeta.checkBits(quantizedRescoreBits);
     }
 
     @Override
@@ -222,7 +306,8 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
             sliceField,
             ivfFlushConfigSource,
             ivfMergeConfigResolver,
-            ashConfigResolver
+            ashConfigResolver,
+            quantizedRescoreBits
         );
     }
 
@@ -252,6 +337,9 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
             + ", "
             + "sliceField="
             + sliceField
+            + ", "
+            + "quantizedRescoreBits="
+            + quantizedRescoreBits
             + ')';
     }
 }

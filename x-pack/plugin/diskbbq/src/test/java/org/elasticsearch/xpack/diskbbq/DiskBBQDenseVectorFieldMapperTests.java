@@ -63,7 +63,7 @@ public class DiskBBQDenseVectorFieldMapperTests extends MapperServiceTestCase {
             assertThat(codec, instanceOf(PerFieldMapperCodec.class));
             KnnVectorsFormat knnVectorsFormat = ((PerFieldMapperCodec) codec).getKnnVectorsFormatForField("field");
             String expectedString = Build.current().isSnapshot()
-                ? "ESNextDiskBBQVectorsFormat(vectorPerCluster=384, mergeExec=" + enabled + ", sliceField=null)"
+                ? "ESNextDiskBBQVectorsFormat(vectorPerCluster=384, mergeExec=" + enabled + ", sliceField=null, quantizedRescoreBits=0)"
                 : "ES950DiskBBQVectorsFormat(vectorPerCluster=384, mergeExec=" + enabled + ")";
             assertEquals(expectedString, knnVectorsFormat.toString());
         }
@@ -152,6 +152,41 @@ public class DiskBBQDenseVectorFieldMapperTests extends MapperServiceTestCase {
                 containsString("sliceField=" + SliceIndexing.SLICE_KEY_FIELD_NAME)
             );
             assertThat(knnVectorsFormatForField(disabledMapperService, tp).toString(), containsString("sliceField=null"));
+        }
+    }
+
+    /**
+     * The mapping option {@code quantized_rescore_bits} must reach the ESNext format, which stores the quantized rescore copy
+     * at that width only when it is set. Both quantization types go through the plugin's format selection.
+     */
+    public void testQuantizedRescoreBitsReachTheFormat() throws Exception {
+        assumeTrue("ESNext DiskBBQ format is only used in snapshots", Build.current().isSnapshot());
+        final Settings settings = IndexSettingsModule.newIndexSettings(
+            "foo",
+            Settings.builder().put(IndexSettings.DENSE_VECTOR_EXPERIMENTAL_FEATURES_SETTING.getKey(), true).build()
+        ).getSettings();
+        for (String quantizationType : List.of("osq", "ash")) {
+            for (int quantizedRescoreBits : new int[] { 0, 2, 4, 8 }) {
+                MapperService mapperService = createMapperService(getVersion(), settings, () -> true, fieldMapping(b -> {
+                    b.field("type", "dense_vector");
+                    b.field("dims", 64);
+                    b.field("index", true);
+                    b.field("similarity", "dot_product");
+                    b.startObject("index_options");
+                    b.field("type", "bbq_disk");
+                    b.field("quantization_type", quantizationType);
+                    if (quantizedRescoreBits != 0) {
+                        b.field("quantized_rescore_bits", quantizedRescoreBits);
+                    }
+                    b.endObject();
+                }));
+                String expectedFormat = quantizationType.equals("ash") ? "ESNextDiskASHVectorsFormat" : "ESNextDiskBBQVectorsFormat";
+                try (var tp = new TestThreadPool(getTestName())) {
+                    String format = knnVectorsFormatForField(mapperService, tp).toString();
+                    assertThat(format, containsString(expectedFormat));
+                    assertThat(format, containsString("quantizedRescoreBits=" + quantizedRescoreBits));
+                }
+            }
         }
     }
 

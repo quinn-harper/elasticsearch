@@ -71,7 +71,9 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             ESNextDiskASHVectorsFormat.VERSION_CURRENT,
             ESNextDiskASHVectorsFormat.VERSION_DIRECT_IO,
             ESNextDiskASHVectorsFormat.VERSION_ON_DISK_MERGE,
-            ESNextDiskASHVectorsFormat.DYNAMIC_VISIT_RATIO
+            ESNextDiskASHVectorsFormat.DYNAMIC_VISIT_RATIO,
+            ESNextDiskASHVectorsFormat.QUANTIZED_RESCORE_EXTENSION,
+            ESNextDiskASHVectorsFormat.VERSION_QUANTIZED_RESCORE
         );
         this.ashMatrixCache = new ConcurrentHashMap<>();
         this.queryBitsPerDim = queryBitsPerDim;

@@ -81,6 +81,7 @@ public class DiskBBQPlugin extends Plugin implements InternalVectorFormatProvide
                     int clusterSize = diskbbq.getClusterSize();
                     boolean onDiskRescore = diskbbq.isOnDiskRescore();
                     boolean onDiskMerge = diskbbq.isOnDiskMerge();
+                    int quantizedRescoreBits = diskbbq.getQuantizedRescoreBits();
                     boolean doPrecondition = diskbbq.doPrecondition();
                     int flatIndexThreshold = diskbbq.getFlatIndexThreshold();
                     final String sliceField = SliceIndexing.SLICE_FEATURE_FLAG.isEnabled() && indexSettings.isSliceEnabled()
@@ -105,7 +106,8 @@ public class DiskBBQPlugin extends Plugin implements InternalVectorFormatProvide
                                 sliceField,
                                 IvfFlushConfigSource.empty(),
                                 IvfMergeConfigResolver.useCodecDefault(),
-                                onDiskMerge
+                                onDiskMerge,
+                                quantizedRescoreBits
                             );
                         }
                         IvfMergeConfigResolver mergeConfigResolver = diskbbq.autoCalibrate()
@@ -125,7 +127,8 @@ public class DiskBBQPlugin extends Plugin implements InternalVectorFormatProvide
                             sliceField,
                             IvfFlushConfigSource.empty(),
                             mergeConfigResolver,
-                            onDiskMerge
+                            onDiskMerge,
+                            quantizedRescoreBits
                         );
                     } else if (indexVersionCreated.onOrAfter(IndexVersions.DISK_BBQ_ES950_AUTO_CALIBRATE)) {
                         IvfMergeConfigResolver mergeConfigResolver = diskbbq.autoCalibrate()
