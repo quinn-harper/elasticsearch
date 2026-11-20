@@ -182,6 +182,50 @@ public class TestConfigurationTests extends ESTestCase {
         }
     }
 
+    public void testResidualRerankParsing() throws Exception {
+        String base = """
+            {
+              "doc_vectors": ["/path/to/docs"],
+              "dimensions": 128,
+              "index_type": "%s",
+              "quantize_bits": 1%s
+            }
+            """;
+        KnnIndexTester.DirectoryTypeConfig defaultDir = KnnIndexTester.getDirectoryTypeConfig("default");
+
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), Strings.format(base, "ivf", ""))) {
+            TestConfiguration config = TestConfiguration.fromXContent(parser);
+            assertTrue("residual codes are the production default", config.residualRerank());
+            assertThat(KnnIndexTester.formatIndexPath(config, defaultDir), containsString("-rr.index"));
+        }
+
+        String ivfWithoutResiduals = Strings.format(base, "ivf", ", \"residual_rerank\": false");
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), ivfWithoutResiduals)) {
+            TestConfiguration config = TestConfiguration.fromXContent(parser);
+            assertFalse(config.residualRerank());
+            assertThat(KnnIndexTester.formatIndexPath(config, defaultDir), not(containsString("-rr")));
+        }
+
+        String ash = """
+            {
+              "doc_vectors": ["/path/to/docs"],
+              "dimensions": 128,
+              "index_type": "ivf",
+              "quantization_type": "ash"
+            }
+            """;
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), ash)) {
+            TestConfiguration config = TestConfiguration.fromXContent(parser);
+            assertThat(KnnIndexTester.formatIndexPath(config, defaultDir), containsString("-rr.index"));
+        }
+
+        String hnswWithoutResiduals = Strings.format(base, "hnsw", ", \"residual_rerank\": false");
+        try (XContentParser parser = createParser(XContentType.JSON.xContent(), hnswWithoutResiduals)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> TestConfiguration.fromXContent(parser));
+            assertThat(e.getMessage(), containsString("residual_rerank"));
+        }
+    }
+
     public void testQueryQuantizeBitsParsing() throws Exception {
         String json = """
             {

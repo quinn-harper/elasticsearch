@@ -10,6 +10,8 @@
 package org.elasticsearch.search.vectors;
 
 import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.codecs.KnnVectorsReader;
+import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.KnnFloatVectorField;
 import org.apache.lucene.index.DirectoryReader;
@@ -20,6 +22,7 @@ import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.queries.function.FunctionScoreQuery;
 import org.apache.lucene.search.ConjunctionUtils;
@@ -37,9 +40,13 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.search.Weight;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.Bits;
+import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.lucene.search.Queries;
 import org.elasticsearch.index.codec.bwc.Elasticsearch93Lucene104Codec;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualRescoringReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.next.ESNextDiskBBQVectorsFormat;
 import org.elasticsearch.index.codec.vectors.es93.ES93HnswScalarQuantizedVectorsFormat;
 import org.elasticsearch.index.codec.zstd.Zstd814StoredFieldsFormat;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
@@ -50,8 +57,11 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.elasticsearch.index.codec.vectors.VectorTestUtils.randomFloatVector;
@@ -61,6 +71,8 @@ import static org.hamcrest.Matchers.arrayWithSize;
 import static org.hamcrest.Matchers.closeTo;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.instanceOf;
 
 public class RescoreKnnVectorQueryTests extends ESTestCase {
 
@@ -124,6 +136,92 @@ public class RescoreKnnVectorQueryTests extends ESTestCase {
                 }
             }
         }
+    }
+
+    /**
+     * Segments whose codec already refines approximate scores with residual codes report it through
+     * {@link ResidualRescoringReader}; the rescore query keeps their inner scores instead of reading raw vectors.
+     */
+    public void testSegmentsWithResidualCodesKeepInnerScores() throws Exception {
+        int numDocs = randomIntBetween(50, 200);
+        int numDims = randomIntBetween(8, 64);
+        int k = randomIntBetween(1, 10);
+        float[] queryVector = unitVector(numDims);
+
+        try (Directory d = newDirectory()) {
+            IndexWriterConfig iwc = newIndexWriterConfig();
+            iwc.setCodec(
+                TestUtil.alwaysKnnVectorsFormat(
+                    new ESNextDiskBBQVectorsFormat(
+                        ESNextDiskBBQVectorsFormat.MIN_VECTORS_PER_CLUSTER,
+                        ESNextDiskBBQVectorsFormat.MIN_CENTROIDS_PER_PARENT_CLUSTER,
+                        null
+                    )
+                )
+            );
+            try (IndexWriter w = new IndexWriter(d, iwc)) {
+                for (int i = 0; i < numDocs; i++) {
+                    Document document = new Document();
+                    document.add(new KnnFloatVectorField(FIELD_NAME, unitVector(numDims), VectorSimilarityFunction.DOT_PRODUCT));
+                    w.addDocument(document);
+                }
+                w.commit();
+            }
+
+            try (IndexReader reader = DirectoryReader.open(d)) {
+                for (LeafReaderContext context : reader.leaves()) {
+                    KnnVectorsReader vectorsReader = Lucene.tryUnwrapSegmentReader(context.reader()).getVectorReader();
+                    if (vectorsReader instanceof PerFieldKnnVectorsFormat.FieldsReader perField) {
+                        vectorsReader = perField.getFieldReader(FIELD_NAME);
+                    }
+                    assertThat(vectorsReader, instanceOf(ResidualRescoringReader.class));
+                    assertTrue(((ResidualRescoringReader) vectorsReader).hasResidualCodes(FIELD_NAME));
+                }
+
+                // an inner query with arbitrary, known scores: those must come back untouched
+                Set<Integer> docs = new HashSet<>();
+                while (docs.size() < k) {
+                    docs.add(randomIntBetween(0, numDocs - 1));
+                }
+                ScoreDoc[] innerScoreDocs = new ScoreDoc[k];
+                Map<Integer, Float> innerScores = new HashMap<>();
+                int i = 0;
+                for (int doc : docs) {
+                    float score = 0.1f + 0.8f * i / k;
+                    innerScoreDocs[i++] = new ScoreDoc(doc, score);
+                    innerScores.put(doc, score);
+                }
+                Query innerQuery = new KnnScoreDocQuery(innerScoreDocs, reader);
+                RescoreKnnVectorQuery rescoreKnnVectorQuery = RescoreKnnVectorQuery.fromInnerQuery(
+                    FIELD_NAME,
+                    queryVector,
+                    k,
+                    k,
+                    innerQuery
+                );
+
+                IndexSearcher searcher = new IndexSearcher(reader);
+                TopDocs rescoredDocs = searcher.search(rescoreKnnVectorQuery, numDocs);
+                assertThat(rescoredDocs.scoreDocs, arrayWithSize(k));
+                for (ScoreDoc scoreDoc : rescoredDocs.scoreDocs) {
+                    assertThat(innerScores, hasKey(scoreDoc.doc));
+                    assertThat(scoreDoc.score, equalTo(innerScores.get(scoreDoc.doc)));
+                }
+            }
+        }
+    }
+
+    private static float[] unitVector(int numDims) {
+        float[] vector = randomFloatVector(numDims);
+        float norm = 0;
+        for (float value : vector) {
+            norm += value * value;
+        }
+        float scale = (float) (1 / Math.sqrt(norm));
+        for (int i = 0; i < vector.length; i++) {
+            vector[i] *= scale;
+        }
+        return vector;
     }
 
     public void testRescoreWithNoMatches() throws Exception {

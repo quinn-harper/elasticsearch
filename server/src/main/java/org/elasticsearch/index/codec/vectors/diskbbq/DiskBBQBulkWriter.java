@@ -30,6 +30,21 @@ public abstract sealed class DiskBBQBulkWriter {
     }
 
     /**
+     * Appends the residual codes of the vector {@code qvv} last returned to {@code residualOut}, when there is such an
+     * output and the source has codes. Residual codes never go into the posting list itself; they take their own file so
+     * the posting lists stay compact and cache on their own.
+     */
+    static void writeResidualCodes(QuantizedVectorValues qvv, IndexOutput residualOut) throws IOException {
+        if (residualOut == null) {
+            return;
+        }
+        final byte[] residualCodes = qvv.residualCodes();
+        if (residualCodes != null) {
+            residualOut.writeBytes(residualCodes, residualCodes.length);
+        }
+    }
+
+    /**
      * Bulk write vectors to disk. Tail vectors are not block encoded.
      * @param qvv quantized vector values
      * @param docsWriter docs writer
@@ -63,12 +78,36 @@ public abstract sealed class DiskBBQBulkWriter {
         boolean blockEncodeTailVectors,
         boolean writeComponentSumAsInt
     ) {
+        return fromBitSize(bitSize, bulkSize, out, blockEncodeTailVectors, writeComponentSumAsInt, null);
+    }
+
+    /**
+     * Factory method to create a DiskBBQBulkWriter based on the bit size.
+     * @param bitSize the bit size of the quantized vectors
+     * @param bulkSize the number of vectors to write in bulk
+     * @param out the IndexOutput to write to
+     * @param blockEncodeTailVectors whether to block encode tail vectors
+     * @param residualOut where the residual codes of the vectors go, {@code dimension} bytes per vector in the order the
+     *                    vectors are written, or {@code null} when the source has none; only block encoded writers take one
+     * @return a DiskBBQBulkWriter instance
+     */
+    public static DiskBBQBulkWriter fromBitSize(
+        int bitSize,
+        int bulkSize,
+        IndexOutput out,
+        boolean blockEncodeTailVectors,
+        boolean writeComponentSumAsInt,
+        IndexOutput residualOut
+    ) {
+        if (residualOut != null && blockEncodeTailVectors == false) {
+            throw new IllegalArgumentException("residual codes are only written by block encoded writers");
+        }
         return switch (bitSize) {
             case 1, 2, 4 -> blockEncodeTailVectors
-                ? new SmallBitEncodedDiskBBQBulkWriter(bulkSize, out, writeComponentSumAsInt)
+                ? new SmallBitEncodedDiskBBQBulkWriter(bulkSize, out, writeComponentSumAsInt, residualOut)
                 : new SmallBitDiskBBQBulkWriter(bulkSize, out, writeComponentSumAsInt);
             case 7 -> blockEncodeTailVectors
-                ? new LargeBitEncodedDiskBBQBulkWriter(bulkSize, out)
+                ? new LargeBitEncodedDiskBBQBulkWriter(bulkSize, out, residualOut)
                 : new LargeBitDiskBBQBulkWriter(bulkSize, out);
             default -> throw new IllegalArgumentException("Unsupported bit size: " + bitSize);
         };
@@ -200,10 +239,16 @@ public abstract sealed class DiskBBQBulkWriter {
         }
     }
 
+    /**
+     * Block encoded variants write each block as {@code [codes x B][corrections x B]} and encode the tail the same way.
+     * When given a residual output they also append each vector's residual codes to it, in the same order.
+     */
     private static class LargeBitEncodedDiskBBQBulkWriter extends LargeBitDiskBBQBulkWriter {
+        private final IndexOutput residualOut;
 
-        private LargeBitEncodedDiskBBQBulkWriter(int bulkSize, IndexOutput out) {
+        private LargeBitEncodedDiskBBQBulkWriter(int bulkSize, IndexOutput out, IndexOutput residualOut) {
             super(bulkSize, out);
+            this.residualOut = residualOut;
         }
 
         @Override
@@ -218,6 +263,7 @@ public abstract sealed class DiskBBQBulkWriter {
                     byte[] qv = qvv.next();
                     corrections[j] = qvv.getCorrections();
                     out.writeBytes(qv, qv.length);
+                    writeResidualCodes(qvv, residualOut);
                 }
                 writeCorrections(corrections);
             }
@@ -232,6 +278,7 @@ public abstract sealed class DiskBBQBulkWriter {
                 byte[] qv = qvv.next();
                 tailCorrections[j] = qvv.getCorrections();
                 out.writeBytes(qv, qv.length);
+                writeResidualCodes(qvv, residualOut);
                 j++;
             }
             writeCorrections(tailCorrections);
@@ -239,9 +286,11 @@ public abstract sealed class DiskBBQBulkWriter {
     }
 
     private static class SmallBitEncodedDiskBBQBulkWriter extends SmallBitDiskBBQBulkWriter {
+        private final IndexOutput residualOut;
 
-        private SmallBitEncodedDiskBBQBulkWriter(int bulkSize, IndexOutput out, boolean writeComponentSumAsInt) {
+        private SmallBitEncodedDiskBBQBulkWriter(int bulkSize, IndexOutput out, boolean writeComponentSumAsInt, IndexOutput residualOut) {
             super(bulkSize, out, writeComponentSumAsInt);
+            this.residualOut = residualOut;
         }
 
         @Override
@@ -256,6 +305,7 @@ public abstract sealed class DiskBBQBulkWriter {
                     byte[] qv = qvv.next();
                     corrections[j] = qvv.getCorrections();
                     out.writeBytes(qv, qv.length);
+                    writeResidualCodes(qvv, residualOut);
                 }
                 writeCorrections(corrections);
             }
@@ -270,6 +320,7 @@ public abstract sealed class DiskBBQBulkWriter {
                 byte[] qv = qvv.next();
                 tailCorrections[j] = qvv.getCorrections();
                 out.writeBytes(qv, qv.length);
+                writeResidualCodes(qvv, residualOut);
                 j++;
             }
             writeCorrections(tailCorrections);

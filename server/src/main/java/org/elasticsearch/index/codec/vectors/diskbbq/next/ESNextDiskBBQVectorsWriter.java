@@ -65,9 +65,11 @@ import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
 import org.elasticsearch.index.codec.vectors.diskbbq.OverspillAssignments;
+import org.elasticsearch.index.codec.vectors.diskbbq.PooledLloydMaxQuantizer;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantizedVectorValues;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualCodesMeta;
 import org.elasticsearch.index.codec.vectors.diskbbq.TieredMergeStrategy;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
 import org.elasticsearch.logging.LogManager;
@@ -103,10 +105,78 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
     private final String sliceField;
     private final IvfFlushConfigSource flushConfigSource;
     private final IvfMergeConfigResolver mergeConfigResolver;
+    // whether float fields get residual codes next to their quantized codes
+    private final boolean residualRerank;
+    // the residual quantizer fitted for the field whose posting lists were just written, written out by doWriteMeta
+    private PooledLloydMaxQuantizer pendingResidualQuantizer;
+    private long pendingResidualOffset;
+    private long pendingResidualLength;
 
     @Override
     protected boolean supportsByteNative() {
         return true;
+    }
+
+    /**
+     * Fits the residual quantizer on a strided sample of the field's vectors, each quantized against its primary
+     * centroid exactly as the posting lists will quantize it. Only float vectors (which includes widened bfloat16)
+     * get residual codes; byte fields, and every field when residual reranking is turned off, return {@code null}.
+     */
+    private PooledLloydMaxQuantizer trainResidualQuantizer(
+        FieldInfo fieldInfo,
+        ClusteringVectorValues<?> vectorValues,
+        CentroidSupplier centroidSupplier,
+        int[] assignments,
+        QuantEncoding encoding
+    ) throws IOException {
+        if (residualRerank == false
+            || fieldInfo.getVectorEncoding() != VectorEncoding.FLOAT32
+            || vectorValues instanceof FloatVectorValues == false
+            || assignments.length == 0
+            || centroidSupplier.size() == 0
+            || centroidSupplier.byteCentroid(0) != null) {
+            return null;
+        }
+        final FloatVectorValues floatVectors = (FloatVectorValues) vectorValues;
+        final int dimension = fieldInfo.getVectorDimension();
+        final OptimizedScalarQuantizer quantizer = new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction());
+        final float[] centered = new float[dimension];
+        final int[] codes = new int[encoding.discretizedDimensions(dimension)];
+        final float[] residual = new float[dimension];
+        final PooledLloydMaxQuantizer.Trainer trainer = new PooledLloydMaxQuantizer.Trainer(dimension);
+        final int sampleSize = PooledLloydMaxQuantizer.trainingSampleSize(assignments.length, dimension);
+        final int stride = Math.max(1, assignments.length / sampleSize);
+        for (int ord = 0, collected = 0; ord < assignments.length && collected < sampleSize; ord += stride, collected++) {
+            final float[] centroid = centroidSupplier.centroid(assignments[ord]);
+            OptimizedScalarQuantizer.QuantizationResult result = quantizer.scalarQuantize(
+                floatVectors.vectorValue(ord),
+                centered,
+                codes,
+                encoding.bits(),
+                centroid
+            );
+            computeResidual(centered, codes, result, encoding.bits(), residual);
+            trainer.add(residual);
+        }
+        return trainer.fit();
+    }
+
+    /**
+     * The part of the centered vector that the OSQ codes do not capture: {@code centered - (lower + step * code)}, with
+     * the same dequantization the scorers use.
+     */
+    static void computeResidual(
+        float[] centered,
+        int[] codes,
+        OptimizedScalarQuantizer.QuantizationResult result,
+        int bits,
+        float[] residual
+    ) {
+        final float lower = result.lowerInterval();
+        final float step = (result.upperInterval() - lower) / ((1 << bits) - 1);
+        for (int i = 0; i < residual.length; i++) {
+            residual[i] = centered[i] - Math.fma(step, codes[i], lower);
+        }
     }
 
     public ESNextDiskBBQVectorsWriter(
@@ -128,6 +198,51 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         IvfFlushConfigSource flushConfigSource,
         IvfMergeConfigResolver mergeConfigResolver
     ) throws IOException {
+        this(
+            state,
+            rawVectorFormatName,
+            useDirectIOReads,
+            onDiskMerge,
+            rawVectorDelegate,
+            centroidIndexFormat,
+            encoding,
+            vectorPerCluster,
+            centroidsPerParentCluster,
+            mergeExec,
+            numMergeWorkers,
+            blockDimension,
+            doPrecondition,
+            flatVectorThreshold,
+            sliceField,
+            flushConfigSource,
+            mergeConfigResolver,
+            true
+        );
+    }
+
+    /**
+     * @param residualRerank whether float fields store residual codes next to their quantized codes
+     */
+    public ESNextDiskBBQVectorsWriter(
+        SegmentWriteState state,
+        String rawVectorFormatName,
+        boolean useDirectIOReads,
+        boolean onDiskMerge,
+        FlatVectorsWriter rawVectorDelegate,
+        CentroidIndexFormat centroidIndexFormat,
+        QuantEncoding encoding,
+        int vectorPerCluster,
+        int centroidsPerParentCluster,
+        TaskExecutor mergeExec,
+        int numMergeWorkers,
+        int blockDimension,
+        boolean doPrecondition,
+        int flatVectorThreshold,
+        String sliceField,
+        IvfFlushConfigSource flushConfigSource,
+        IvfMergeConfigResolver mergeConfigResolver,
+        boolean residualRerank
+    ) throws IOException {
         super(
             state,
             rawVectorFormatName,
@@ -141,7 +256,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             true,
             flatVectorThreshold,
             onDiskMerge,
-            true
+            true,
+            ESNextDiskBBQVectorsFormat.RESIDUAL_EXTENSION
         );
         this.vectorPerCluster = vectorPerCluster;
         this.centroidIndexFormat = centroidIndexFormat;
@@ -154,6 +270,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         this.sliceField = sliceField;
         this.flushConfigSource = flushConfigSource != null ? flushConfigSource : IvfFlushConfigSource.empty();
         this.mergeConfigResolver = mergeConfigResolver != null ? mergeConfigResolver : IvfMergeConfigResolver.useCodecDefault();
+        this.residualRerank = residualRerank;
     }
 
     @Override
@@ -240,7 +357,18 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         // write the posting lists
         final PackedLongValues.Builder offsets = PackedLongValues.monotonicBuilder(PackedInts.COMPACT);
         final PackedLongValues.Builder lengths = PackedLongValues.monotonicBuilder(PackedInts.COMPACT);
-        DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(effectiveQuantEncoding.bits(), BULK_SIZE, postingsOutput, true, true);
+        pendingResidualQuantizer = trainResidualQuantizer(fieldInfo, vectorValues, centroidSupplier, assignments, effectiveQuantEncoding);
+        final IndexOutput residualOut = pendingResidualQuantizer == null ? null : residualOutput();
+        final long residualFileOffset = residualOut == null ? 0 : residualOut.getFilePointer();
+        pendingResidualOffset = residualFileOffset;
+        DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(
+            effectiveQuantEncoding.bits(),
+            BULK_SIZE,
+            postingsOutput,
+            true,
+            true,
+            residualOut
+        );
         final QuantizedVectorValues quantizedVectors;
         if (isByte) {
             quantizedVectors = new OnHeapQuantizedByteVectors(
@@ -256,7 +384,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                 fieldInfo.getVectorSimilarityFunction(),
                 effectiveQuantEncoding,
                 fieldInfo.getVectorDimension(),
-                new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction())
+                new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction()),
+                pendingResidualQuantizer
             );
         }
         final int[] docIdsScratch = new int[maxPostingListSize];
@@ -281,6 +410,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             int size = cluster.length;
             // write docIds
             postingsOutput.writeVInt(size);
+            if (residualOut != null) {
+                postingsOutput.writeVLong(residualOut.getFilePointer() - residualFileOffset);
+            }
             for (int j = 0; j < size; j++) {
                 docIdsScratch[j] = vectorValues.ordToDoc(cluster[j]);
                 clusterOrds[j] = j;
@@ -316,6 +448,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             lengths.add(postingsOutput.getFilePointer() - fileOffset - offset);
         }
 
+        pendingResidualLength = residualOut == null ? 0 : residualOut.getFilePointer() - residualFileOffset;
+
         if (logger.isDebugEnabled()) {
             printClusterQualityStatistics(assignmentsByCluster);
         }
@@ -343,6 +477,12 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         var vectorSimilarityFunction = fieldInfo.getVectorSimilarityFunction();
         FlatCentroidClusters centroidClusters = (FlatCentroidClusters) centroidSupplier.centroidIndex();
         PackedLongValues.Builder vectorCentroidOffsets = PackedLongValues.monotonicBuilder(PackedInts.COMPACT);
+        pendingResidualQuantizer = trainResidualQuantizer(fieldInfo, vectorValues, centroidSupplier, assignments, effectiveQuantEncoding);
+        final PooledLloydMaxQuantizer residualQuantizer = pendingResidualQuantizer;
+        final int residualLength = residualQuantizer == null ? 0 : fieldInfo.getVectorDimension();
+        final IndexOutput residualOut = residualQuantizer == null ? null : residualOutput();
+        final long residualFileOffset = residualOut == null ? 0 : residualOut.getFilePointer();
+        pendingResidualOffset = residualFileOffset;
         String quantizedVectorsTempName = null;
         try (
             IndexOutput quantizedVectorsTemp = mergeState.segmentInfo.dir.createTempOutput(
@@ -356,6 +496,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             int[] quantized = new int[effectiveQuantEncoding.discretizedDimensions(fieldInfo.getVectorDimension())];
             byte[] binary = new byte[effectiveQuantEncoding.getDocPackedLength(fieldInfo.getVectorDimension())];
             float[] scratch = new float[fieldInfo.getVectorDimension()];
+            float[] residual = new float[residualLength];
+            byte[] residualCodes = new byte[residualLength];
             final boolean isByte = vectorValues instanceof ByteVectorValues;
             for (int i = 0; i < assignments.length; i++) {
                 // record where this vector's centroid data starts
@@ -394,6 +536,11 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                 }
                 effectiveQuantEncoding.pack(quantized, binary);
                 writeQuantizedValue(quantizedVectorsTemp, binary, result);
+                if (residualQuantizer != null) {
+                    computeResidual(scratch, quantized, result, effectiveQuantEncoding.bits(), residual);
+                    residualQuantizer.encode(residual, residualCodes);
+                    quantizedVectorsTemp.writeBytes(residualCodes, residualLength);
+                }
 
                 // write the overspill vectors immediately afterwards
                 for (var it = overspillAssignments.getAssignmentsFor(i); it.hasNext();) {
@@ -433,6 +580,11 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                     }
                     effectiveQuantEncoding.pack(quantized, binary);
                     writeQuantizedValue(quantizedVectorsTemp, binary, result);
+                    if (residualQuantizer != null) {
+                        computeResidual(scratch, quantized, result, effectiveQuantEncoding.bits(), residual);
+                        residualQuantizer.encode(residual, residualCodes);
+                        quantizedVectorsTemp.writeBytes(residualCodes, residualLength);
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -485,14 +637,16 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                 quantizedVectorsInput,
                 effectiveQuantEncoding,
                 fieldInfo.getVectorDimension(),
-                vectorCentroidOffsets.build()
+                vectorCentroidOffsets.build(),
+                residualLength
             );
             DiskBBQBulkWriter bulkWriter = DiskBBQBulkWriter.fromBitSize(
                 effectiveQuantEncoding.bits(),
                 BULK_SIZE,
                 postingsOutput,
                 true,
-                true
+                true,
+                residualOut
             );
             // write the posting lists
             final int[] docIdsScratch = new int[maxPostingListSize];
@@ -514,6 +668,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                 // write docIds
                 int size = cluster.length;
                 postingsOutput.writeVInt(size);
+                if (residualOut != null) {
+                    postingsOutput.writeVLong(residualOut.getFilePointer() - residualFileOffset);
+                }
                 for (int j = 0; j < size; j++) {
                     docIdsScratch[j] = vectorValues.ordToDoc(cluster[j]);
                     clusterOrds[j] = j;
@@ -543,6 +700,8 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                 }
                 lengths.add(postingsOutput.getFilePointer() - fileOffset - offset);
             }
+
+            pendingResidualLength = residualOut == null ? 0 : residualOut.getFilePointer() - residualFileOffset;
 
             if (logger.isDebugEnabled()) {
                 printClusterQualityStatistics(assignmentsByCluster);
@@ -718,6 +877,13 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         // ESNext format extension: byte centroid flag — indicates whether raw centroids
         // are stored as 1 byte/dim (byte fields) or 4 bytes/dim (float fields).
         metaOutput.writeByte(byteCentroids ? (byte) 1 : (byte) 0);
+        ResidualCodesMeta.write(
+            metaOutput,
+            pendingResidualQuantizer == null
+                ? null
+                : new ResidualCodesMeta(pendingResidualQuantizer, pendingResidualOffset, pendingResidualLength)
+        );
+        pendingResidualQuantizer = null;
     }
 
     @Override
@@ -1225,6 +1391,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         private final int[] quantizedVectorScratch;
         private final float[] floatVectorScratch;
         private final QuantEncoding encoding;
+        private final PooledLloydMaxQuantizer residualQuantizer;
+        private final float[] residualScratch;
+        private final byte[] residualCodes;
         private OptimizedScalarQuantizer.QuantizationResult corrections;
         private final VectorSimilarityFunction similarityFunction;
         private float[] currentCentroid, currentParentCentroid;
@@ -1239,6 +1408,21 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             int dimension,
             OptimizedScalarQuantizer quantizer
         ) {
+            this(vectorValues, similarityFunction, encoding, dimension, quantizer, null);
+        }
+
+        /**
+         * @param residualQuantizer encodes the residual of every quantized vector into {@link #residualCodes()}, or
+         *                          {@code null} to write no residual codes
+         */
+        OnHeapQuantizedVectors(
+            FloatVectorValues vectorValues,
+            VectorSimilarityFunction similarityFunction,
+            QuantEncoding encoding,
+            int dimension,
+            OptimizedScalarQuantizer quantizer,
+            PooledLloydMaxQuantizer residualQuantizer
+        ) {
             this.vectorValues = vectorValues;
             this.similarityFunction = similarityFunction;
             this.encoding = encoding;
@@ -1246,6 +1430,9 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             this.quantizedVector = new byte[encoding.getDocPackedLength(dimension)];
             this.floatVectorScratch = new float[dimension];
             this.quantizedVectorScratch = new int[encoding.discretizedDimensions(dimension)];
+            this.residualQuantizer = residualQuantizer;
+            this.residualScratch = residualQuantizer == null ? null : new float[dimension];
+            this.residualCodes = residualQuantizer == null ? null : new byte[dimension];
             this.corrections = null;
             this.currentParentCentroid = null;
         }
@@ -1272,6 +1459,10 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             int ord = ordTransformer.apply(currOrd);
             float[] vector = vectorValues.vectorValue(ord);
             corrections = quantizer.scalarQuantize(vector, floatVectorScratch, quantizedVectorScratch, encoding.bits(), currentCentroid);
+            if (residualQuantizer != null) {
+                computeResidual(floatVectorScratch, quantizedVectorScratch, corrections, encoding.bits(), residualScratch);
+                residualQuantizer.encode(residualScratch, residualCodes);
+            }
             // note, with a parent centroid, our correction needs to take it into account
             if (currentParentCentroid != null) {
                 float additionalCorrection = switch (similarityFunction) {
@@ -1296,6 +1487,14 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
                 throw new IllegalStateException("No vector read yet, call next first");
             }
             return corrections;
+        }
+
+        @Override
+        public byte[] residualCodes() {
+            if (currOrd == -1) {
+                throw new IllegalStateException("No vector read yet, call next first");
+            }
+            return residualCodes;
         }
     }
 
@@ -1391,6 +1590,7 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         private final PackedLongValues vectorCentroidOffsets;
         private final byte[] binaryScratch;
         private final float[] corrections = new float[3];
+        private final byte[] residualScratch;
 
         private final long vectorByteSize;
         private int bitSum;
@@ -1405,10 +1605,25 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             int dimension,
             PackedLongValues vectorCentroidOffsets
         ) {
+            this(quantizedVectorsInput, encoding, dimension, vectorCentroidOffsets, 0);
+        }
+
+        /**
+         * @param residualLength number of residual code bytes stored after each quantized vector in the input, or
+         *                       {@code 0} when the input has none
+         */
+        OffHeapQuantizedVectors(
+            IndexInput quantizedVectorsInput,
+            QuantEncoding encoding,
+            int dimension,
+            PackedLongValues vectorCentroidOffsets,
+            int residualLength
+        ) {
             this.quantizedVectorsInput = quantizedVectorsInput;
             this.vectorCentroidOffsets = vectorCentroidOffsets;
             this.binaryScratch = new byte[encoding.getDocPackedLength(dimension)];
-            this.vectorByteSize = (binaryScratch.length + 3 * Float.BYTES + Integer.BYTES);
+            this.residualScratch = residualLength > 0 ? new byte[residualLength] : null;
+            this.vectorByteSize = (binaryScratch.length + 3 * Float.BYTES + Integer.BYTES + residualLength);
         }
 
         private void reset(int count, IntToIntFunction isOverspill, IntToIntFunction ordTransformer) {
@@ -1453,6 +1668,17 @@ public class ESNextDiskBBQVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             quantizedVectorsInput.readBytes(binaryScratch, 0, binaryScratch.length);
             quantizedVectorsInput.readFloats(corrections, 0, 3);
             bitSum = quantizedVectorsInput.readInt();
+            if (residualScratch != null) {
+                quantizedVectorsInput.readBytes(residualScratch, 0, residualScratch.length);
+            }
+        }
+
+        @Override
+        public byte[] residualCodes() {
+            if (currOrd == -1) {
+                throw new IllegalStateException("No vector read yet, call readQuantizedVector first");
+            }
+            return residualScratch;
         }
     }
 }

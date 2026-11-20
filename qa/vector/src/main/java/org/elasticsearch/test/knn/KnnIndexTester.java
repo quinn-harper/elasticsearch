@@ -268,6 +268,10 @@ public class KnnIndexTester {
                         suffix.add("q" + args.queryQuantizeBits());
                     }
                 }
+                if (args.residualRerank()) {
+                    // indices with residual codes in their posting lists must not be mistaken for ones without
+                    suffix.add("rr");
+                }
             }
             case HNSW -> {
                 suffix.add(Integer.toString(args.hnswM()));
@@ -344,7 +348,8 @@ public class KnnIndexTester {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         IvfMergeConfigResolver.useCodecDefault(),
-                        false
+                        false,
+                        args.residualRerank()
                     );
                 } else {
                     var encoding = resolveQuantEncoding(quantizeBits, args.queryQuantizeBits());
@@ -365,7 +370,8 @@ public class KnnIndexTester {
                         sliceField,
                         IvfFlushConfigSource.empty(),
                         mergeConfigResolver,
-                        false
+                        false,
+                        args.residualRerank()
                     );
                 }
             }
@@ -1385,6 +1391,7 @@ public class KnnIndexTester {
         "merge_policy",
         "on_disk_rescore",
         "precondition",
+        "residual_rerank",
         "flat_vector_threshold",
         "top_k",
         "num_candidates",
@@ -1500,6 +1507,7 @@ public class KnnIndexTester {
                             config.mergePolicy() != null ? config.mergePolicy().name().toLowerCase(Locale.ROOT) : "",
                             Boolean.toString(config.onDiskRescore()),
                             Boolean.toString(config.doPrecondition()),
+                            Boolean.toString(config.residualRerank()),
                             Integer.toString(config.flatVectorThreshold()),
                             Integer.toString(sp.topK()),
                             Integer.toString(sp.numCandidates()),

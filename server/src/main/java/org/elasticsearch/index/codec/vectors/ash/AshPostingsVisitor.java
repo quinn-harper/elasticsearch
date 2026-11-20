@@ -19,7 +19,9 @@ import org.apache.lucene.util.VectorUtil;
 import org.elasticsearch.common.CheckedIntFunction;
 import org.elasticsearch.index.codec.vectors.diskbbq.DocIdsWriter;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.PooledLloydMaxQuantizer;
 import org.elasticsearch.index.codec.vectors.diskbbq.PostingMetadata;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualScoreRefiner;
 import org.elasticsearch.index.codec.vectors.diskbbq.SlicedBlockRange;
 import org.elasticsearch.search.vectors.BulkKnnCollector;
 import org.elasticsearch.simdvec.AshScorer;
@@ -45,6 +47,10 @@ import static org.elasticsearch.simdvec.ES940OSQVectorsScorer.BULK_SIZE;
  * </pre>
  * Corrections use SoA (Structure of Arrays) layout: each correction field is stored
  * contiguously for all vectors in the block, matching the OSQ correction format.
+ * Residual codes (one byte per original dimension, present when the segment stores a residual
+ * quantizer) live in the residual file, in posting list order; the posting list header records where
+ * its vectors' codes start. They are only read for the vectors of a block that could still enter the
+ * collector; their decoded residual sharpens the estimated dot product before the similarity conversion.
  * <p>
  * Two scoring paths are supported:
  * <ul>
@@ -143,6 +149,11 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
      * @param bitsPerDim bits per dimension for document codes
      * @param queryBitsPerDim bits per dimension for query quantization (0 for float path)
      * @param centroidReader function mapping centroid ordinal to float[] centroid vector
+     * @param residualQuantizer decodes the residual codes in the residual file, or {@code null} when the segment stores
+     *                          none
+     * @param residualInput the field's region of the residual file, {@code null} exactly when the quantizer is
+     * @param refineWithResiduals whether competitive candidates get their score refined with the residual codes; tests
+     *                            pass {@code false} to measure the coarse scores of a segment that has them
      * @return a configured visitor for the appropriate scoring path
      */
     public static AshPostingsVisitor<?> create(
@@ -153,9 +164,24 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         Bits acceptDocs,
         int bitsPerDim,
         int queryBitsPerDim,
-        CheckedIntFunction<float[], IOException> centroidReader
+        CheckedIntFunction<float[], IOException> centroidReader,
+        PooledLloydMaxQuantizer residualQuantizer,
+        IndexInput residualInput,
+        boolean refineWithResiduals
     ) throws IOException {
-        return createVisitor(matrix, query, similarityFunction, indexInput, acceptDocs, bitsPerDim, queryBitsPerDim, centroidReader);
+        return createVisitor(
+            matrix,
+            query,
+            similarityFunction,
+            indexInput,
+            acceptDocs,
+            bitsPerDim,
+            queryBitsPerDim,
+            centroidReader,
+            residualQuantizer,
+            residualInput,
+            refineWithResiduals
+        );
     }
 
     /**
@@ -171,6 +197,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
      * @param bitsPerDim bits per dimension for document codes
      * @param queryBitsPerDim bits per dimension for query quantization (0 for float path)
      * @param centroidReader function mapping centroid ordinal to float[] centroid vector
+     * @param residualQuantizer decodes the residual codes in the residual file, or {@code null} when the segment stores
+     *                          none
+     * @param residualInput the field's region of the residual file, {@code null} exactly when the quantizer is
+     * @param refineWithResiduals whether competitive candidates get their score refined with the residual codes
      * @param vectorValues vector values for ordinal-to-doc translation in the sliced path
      * @param startDoc inclusive start of the slice doc range
      * @param endDoc exclusive end of the slice doc range
@@ -185,6 +215,9 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         int bitsPerDim,
         int queryBitsPerDim,
         CheckedIntFunction<float[], IOException> centroidReader,
+        PooledLloydMaxQuantizer residualQuantizer,
+        IndexInput residualInput,
+        boolean refineWithResiduals,
         KnnVectorValues vectorValues,
         int startDoc,
         int endDoc
@@ -197,7 +230,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
             acceptDocs,
             bitsPerDim,
             queryBitsPerDim,
-            centroidReader
+            centroidReader,
+            residualQuantizer,
+            residualInput,
+            refineWithResiduals
         );
         return new SlicedAshPostingsVisitor<>(base, vectorValues, startDoc, endDoc);
     }
@@ -210,10 +246,17 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         Bits acceptDocs,
         int bitsPerDim,
         int queryBitsPerDim,
-        CheckedIntFunction<float[], IOException> centroidReader
+        CheckedIntFunction<float[], IOException> centroidReader,
+        PooledLloydMaxQuantizer residualQuantizer,
+        IndexInput residualInput,
+        boolean refineWithResiduals
     ) throws IOException {
+        assert (residualQuantizer == null) == (residualInput == null);
         // Precompute query projection: queryTransformed = W^T @ query
         float[] queryTransformed = matrix.projectQuery(query);
+        ResidualScoreRefiner residualRefiner = residualQuantizer == null
+            ? null
+            : new ResidualScoreRefiner(similarityFunction, residualQuantizer);
 
         if (queryBitsPerDim > 0) {
             QuantizedQuery qq = quantizeQuery(queryTransformed, matrix.nDims(), queryBitsPerDim, bitsPerDim);
@@ -233,7 +276,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
                 acceptDocs,
                 bitsPerDim,
                 qq,
-                centroidReader
+                centroidReader,
+                residualRefiner,
+                residualInput,
+                refineWithResiduals
             );
         } else {
             AshScorer<float[]> scorer = ESVectorUtil.getAshFloatVectorsScorer(indexInput, matrix.nDims(), bitsPerDim);
@@ -247,7 +293,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
                 acceptDocs,
                 bitsPerDim,
                 null,
-                centroidReader
+                centroidReader,
+                residualRefiner,
+                residualInput,
+                refineWithResiduals
             );
         }
     }
@@ -281,10 +330,24 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
     final ScoreTransform correctionApplier;
     final ScoreTransform similarityConverter;
 
+    // Residual rerank state: the refiner and input are null and residualLength 0 when the segment stores no residual codes
+    final ResidualScoreRefiner residualRefiner;
+    final IndexInput residualInput;
+    final int residualLength;
+    final boolean refineWithResiduals;
+    private final byte[] residualScratch;
+    private final float[] centeredQueryScratch;
+    // where the current posting list's residual codes start in the residual file
+    private long residualBase;
+    // posting list ordinal of the next block's first vector, which locates its residual codes
+    int blockOrdinal;
+
     // Scratch buffers for bulk I/O
     final DocIdsWriter idsWriter = new DocIdsWriter();
     final int[] docIdsScratch = new int[BULK_SIZE];
     private final float[] scores = new float[BULK_SIZE];
+    // the estimated dot products of the block before similarity conversion, kept so the residual can be added to them
+    private final float[] dotProducts = new float[BULK_SIZE];
     // Per-vector corrections in SoA layout: [scales][offsets][docSums][vecCentroidDots][vecCentroidSqDists]
     private final byte[] bulkCorrectionsBuf = new byte[BULK_SIZE * CORRECTION_BYTES];
 
@@ -318,7 +381,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         int packedCodeBytes,
         ScoreTransform correctionApplier,
         ScoreTransform similarityConverter,
-        CheckedIntFunction<float[], IOException> centroidReader
+        CheckedIntFunction<float[], IOException> centroidReader,
+        ResidualScoreRefiner residualRefiner,
+        IndexInput residualInput,
+        boolean refineWithResiduals
     ) {
         this.indexInput = indexInput;
         this.acceptDocs = acceptDocs;
@@ -330,6 +396,12 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         this.scorerQuery = scorerQuery;
         this.correctionApplier = correctionApplier;
         this.similarityConverter = similarityConverter;
+        this.residualRefiner = residualRefiner;
+        this.residualInput = residualInput;
+        this.refineWithResiduals = refineWithResiduals && residualRefiner != null;
+        this.residualLength = residualRefiner == null ? 0 : residualRefiner.dimension();
+        this.residualScratch = residualRefiner == null ? null : new byte[residualLength];
+        this.centeredQueryScratch = residualRefiner == null ? null : new float[residualLength];
     }
 
     /**
@@ -343,6 +415,9 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
      * @param bitsPerDim bits per dimension for document codes
      * @param quantizedQuery quantized query parameters (null for float path)
      * @param centroidReader function mapping centroid ordinal to float[] centroid vector
+     * @param residualRefiner refines competitive scores with the stored residual codes, null when the segment has none
+     * @param residualInput the field's region of the residual file, null exactly when the refiner is
+     * @param refineWithResiduals whether to apply the refiner; false keeps the coarse scores (used by tests)
      */
     private AshPostingsVisitor(
         int nDims,
@@ -354,7 +429,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         Bits acceptDocs,
         int bitsPerDim,
         QuantizedQuery quantizedQuery,
-        CheckedIntFunction<float[], IOException> centroidReader
+        CheckedIntFunction<float[], IOException> centroidReader,
+        ResidualScoreRefiner residualRefiner,
+        IndexInput residualInput,
+        boolean refineWithResiduals
     ) {
         this.indexInput = indexInput;
         this.acceptDocs = acceptDocs;
@@ -364,6 +442,12 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         this.centroidReader = centroidReader;
         this.scorer = scorer;
         this.scorerQuery = scorerQuery;
+        this.residualRefiner = residualRefiner;
+        this.residualInput = residualInput;
+        this.refineWithResiduals = refineWithResiduals && residualRefiner != null;
+        this.residualLength = residualRefiner == null ? 0 : residualRefiner.dimension();
+        this.residualScratch = residualRefiner == null ? null : new byte[residualLength];
+        this.centeredQueryScratch = residualRefiner == null ? null : new float[residualLength];
 
         // Correction applier: captures quantization params for integer path,
         // or uses the simple float formula. Reads from the SoA correction buffer using per-block base offsets.
@@ -412,15 +496,26 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         // Compute exact query·centroid dot product from the real centroid vector
         float[] centroid = centroidReader.apply(centroidOrd);
         currentQueryDotCentroid = ESVectorUtil.dotProduct(query, centroid);
+        if (residualRefiner != null) {
+            // the estimated dot product is <q - mu, scale * W code> plus exact terms, so the residual is scored against q - mu
+            for (int i = 0; i < residualLength; i++) {
+                centeredQueryScratch[i] = query[i] - centroid[i];
+            }
+            residualRefiner.setCenteredQuery(centeredQueryScratch);
+        }
 
         // Read centroid norm squared from header; compute ‖q-μ*‖² for EUCLIDEAN
         currentCentroidNormSq = Float.intBitsToFloat(indexInput.readInt());
         if (similarityFunction == VectorSimilarityFunction.EUCLIDEAN) {
             currentQueryCentroidSqDist = ESVectorUtil.squareDistance(query, centroid);
         }
+        if (residualLength > 0) {
+            residualBase = indexInput.readVLong();
+        }
 
         docEncoding = indexInput.readByte();
         docBase = 0;
+        blockOrdinal = 0;
 
         return vectors;
     }
@@ -446,12 +541,14 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
     }
 
     private int processBlock(KnnCollector knnCollector, int blockSize) throws IOException {
+        final int blockStart = blockOrdinal;
+        blockOrdinal += blockSize;
         readDocIds(blockSize);
         int mask = filterAcceptedDocsMask(blockSize);
         int docsToScore = Integer.bitCount(mask);
         if (docsToScore == 0) {
             // Skip the entire block: codes + corrections
-            long bytesToSkip = (long) blockSize * packedCodeBytes + (long) blockSize * CORRECTION_BYTES;
+            long bytesToSkip = (long) blockSize * (packedCodeBytes + CORRECTION_BYTES);
             indexInput.skipBytes(bytesToSkip);
             return 0;
         }
@@ -478,6 +575,7 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
         for (int j = 0; j < blockSize; j++) {
             if (docIdsScratch[j] != -1) {
                 float approxDotProduct = correctionApplier.apply(scores[j], bulkCorrectionsBuf, j);
+                dotProducts[j] = approxDotProduct;
                 scores[j] = similarityConverter.apply(approxDotProduct, bulkCorrectionsBuf, j);
                 if (scores[j] > maxScore) {
                     maxScore = scores[j];
@@ -485,10 +583,47 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
             }
         }
 
+        // Step 4: Refine the candidates that could still enter the collector with their residual codes
+        maxScore = refineBlock(knnCollector, blockSize, blockStart, maxScore);
+
         if (knnCollector.minCompetitiveSimilarity() < maxScore) {
             collectBulk(knnCollector, blockSize, mask, docsToScore, maxScore);
         }
         return docsToScore;
+    }
+
+    /**
+     * Adds the decoded residual's contribution to the estimated dot product of every vector in the block whose coarse
+     * score beats the collector's cutoff and converts those again. The residual codes come from the residual file and
+     * are only read for those vectors, so a block with nothing competitive costs no residual read at all.
+     *
+     * @param blockStart posting list ordinal of the block's first vector, which locates its codes in the residual file
+     * @return the largest score of the block after refinement
+     */
+    private float refineBlock(KnnCollector knnCollector, int blockSize, int blockStart, float maxScore) throws IOException {
+        if (refineWithResiduals == false) {
+            return maxScore;
+        }
+        final float minCompetitive = knnCollector.minCompetitiveSimilarity();
+        if (minCompetitive >= maxScore) {
+            return maxScore;
+        }
+        maxScore = Float.NEGATIVE_INFINITY;
+        for (int j = 0; j < blockSize; j++) {
+            if (docIdsScratch[j] == -1) {
+                continue;
+            }
+            if (scores[j] > minCompetitive) {
+                residualInput.seek(residualBase + (long) (blockStart + j) * residualLength);
+                residualInput.readBytes(residualScratch, 0, residualLength);
+                float refinedDotProduct = ResidualScoreRefiner.refineDotProduct(dotProducts[j], residualRefiner.delta(residualScratch, 0));
+                scores[j] = similarityConverter.apply(refinedDotProduct, bulkCorrectionsBuf, j);
+            }
+            if (scores[j] > maxScore) {
+                maxScore = scores[j];
+            }
+        }
+        return maxScore;
     }
 
     // package-private so SlicedAshPostingsVisitor can override
@@ -572,7 +707,10 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
                 delegate.packedCodeBytes,
                 delegate.correctionApplier,
                 delegate.similarityConverter,
-                delegate.centroidReader
+                delegate.centroidReader,
+                delegate.residualRefiner,
+                delegate.residualInput,
+                delegate.refineWithResiduals
             );
             this.startDocId = startDocId;
             this.endDocId = endDocId;
@@ -588,6 +726,7 @@ public class AshPostingsVisitor<T> implements IVFVectorsReader.PostingVisitor {
             SlicedBlockRange range = SlicedBlockRange.compute(vectorValues, startDocId, endDocId, totalVectors, BULK_SIZE, perVectorBytes);
             this.vectors = range.vectors();
             docBase = range.docBase();
+            blockOrdinal = range.docBase();
             indexInput.skipBytes(range.skipBytes());
             return this.vectors;
         }

@@ -106,6 +106,8 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
     protected static final int NO_ON_DISK_MERGE_IN_META = -1;
 
     protected final IndexInput ivfCentroids, ivfClusters;
+    /** The residual codes file, or {@code null} when this codec version or this segment has none. */
+    protected final IndexInput ivfResiduals;
     private final SegmentReadState state;
     protected final FieldInfos fieldInfos;
     protected final IntObjectHashMap<E> fields;
@@ -117,7 +119,6 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
     private final float dynamicVisitRatio;
     protected int versionMeta = -1;
 
-    @SuppressWarnings("this-escape")
     protected IVFVectorsReader(
         SegmentReadState state,
         GenericFlatVectorReaders.LoadFlatVectorsReader loadReader,
@@ -130,6 +131,45 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         int versionDirectIo,
         int versionOnDiskMerge,
         float dynamicVisitRatio
+    ) throws IOException {
+        this(
+            state,
+            loadReader,
+            codecName,
+            centroidExtension,
+            clusterExtension,
+            metaExtension,
+            versionStart,
+            versionCurrent,
+            versionDirectIo,
+            versionOnDiskMerge,
+            dynamicVisitRatio,
+            null,
+            Integer.MAX_VALUE
+        );
+    }
+
+    /**
+     * @param residualExtension extension of the file holding residual codes for reranking, or {@code null} when this codec
+     *                          version has none
+     * @param versionResiduals  the first meta version whose segments carry that file; older segments leave
+     *                          {@link #ivfResiduals} null
+     */
+    @SuppressWarnings("this-escape")
+    protected IVFVectorsReader(
+        SegmentReadState state,
+        GenericFlatVectorReaders.LoadFlatVectorsReader loadReader,
+        String codecName,
+        String centroidExtension,
+        String clusterExtension,
+        String metaExtension,
+        int versionStart,
+        int versionCurrent,
+        int versionDirectIo,
+        int versionOnDiskMerge,
+        float dynamicVisitRatio,
+        String residualExtension,
+        int versionResiduals
     ) throws IOException {
         this.state = state;
         this.fieldInfos = state.fieldInfos;
@@ -163,6 +203,9 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
             }
             ivfCentroids = openDataInput(state, versionMeta, centroidExtension, codecName, versionStart, versionCurrent, state.context);
             ivfClusters = openDataInput(state, versionMeta, clusterExtension, codecName, versionStart, versionCurrent, state.context);
+            ivfResiduals = residualExtension != null && versionMeta >= versionResiduals
+                ? openDataInput(state, versionMeta, residualExtension, codecName, versionStart, versionCurrent, state.context)
+                : null;
         } catch (Throwable t) {
             IOUtils.closeWhileHandlingException(this);
             throw t;
@@ -186,6 +229,7 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         this.versionMeta = other.versionMeta;
         this.ivfCentroids = other.ivfCentroids;
         this.ivfClusters = other.ivfClusters;
+        this.ivfResiduals = other.ivfResiduals;
     }
 
     public abstract CentroidIterator getCentroidIterator(
@@ -343,6 +387,9 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
         }
         CodecUtil.checksumEntireFile(ivfCentroids);
         CodecUtil.checksumEntireFile(ivfClusters);
+        if (ivfResiduals != null) {
+            CodecUtil.checksumEntireFile(ivfResiduals);
+        }
     }
 
     @Override
@@ -623,6 +670,9 @@ public abstract class IVFVectorsReader<E extends IVFVectorsReader.FieldEntry> ex
     public void close() throws IOException {
         List<Closeable> closeables = new ArrayList<>(genericReaders.allReaders());
         Collections.addAll(closeables, ivfCentroids, ivfClusters);
+        if (ivfResiduals != null) {
+            closeables.add(ivfResiduals);
+        }
         IOUtils.close(closeables);
     }
 

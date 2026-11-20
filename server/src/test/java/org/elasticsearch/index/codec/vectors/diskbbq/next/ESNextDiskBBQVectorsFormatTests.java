@@ -52,6 +52,8 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.index.codec.vectors.ESBaseKnnVectorsFormatTestCase;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
+import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
 import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
@@ -81,10 +83,12 @@ import static org.hamcrest.Matchers.arrayContaining;
 import static org.hamcrest.Matchers.arrayWithSize;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.oneOf;
 
 public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestCase {
@@ -185,7 +189,7 @@ public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestC
             }
             var offHeap = knnVectorsReader.getOffHeapByteSize(fieldInfo);
             long totalByteSize = offHeap.values().stream().mapToLong(Long::longValue).sum();
-            assertThat(offHeap, aMapWithSize(3));
+            assertThat(offHeap, aMapWithSize(4));
             assertThat(totalByteSize, greaterThanOrEqualTo(0L));
         } else {
             throw new AssertionError("unexpected:" + r.getClass());
@@ -234,7 +238,7 @@ public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestC
                     }
                     var fieldInfo = r.getFieldInfos().fieldInfo("f");
                     var offHeap = knnVectorsReader.getOffHeapByteSize(fieldInfo);
-                    assertThat(offHeap, aMapWithSize(3));
+                    assertThat(offHeap, aMapWithSize(4));
                 }
             }
         }
@@ -747,6 +751,175 @@ public class ESNextDiskBBQVectorsFormatTests extends ESBaseKnnVectorsFormatTestC
                 }
             }
         }
+    }
+
+    /**
+     * Every float segment stores residual codes next to its 1-bit OSQ codes. Refining competitive candidates with them
+     * must bring the scores the IVF search returns much closer to the exact similarity than the coarse codes alone, on
+     * flushed segments as well as on merged ones (which take the off-heap write path).
+     */
+    public void testResidualRerankSharpensScores() throws IOException {
+        String vectorField = "vector";
+        String idField = "id";
+        int numDocs = random().nextInt(300, 600);
+        int dimensions = random().nextInt(32, 96);
+        VectorSimilarityFunction similarity = randomFrom(
+            VectorSimilarityFunction.DOT_PRODUCT,
+            VectorSimilarityFunction.EUCLIDEAN,
+            VectorSimilarityFunction.MAXIMUM_INNER_PRODUCT
+        );
+        ESNextDiskBBQVectorsFormat localFormat = new ESNextDiskBBQVectorsFormat(
+            QuantEncoding.ONE_BIT_4BIT_QUERY,
+            MIN_VECTORS_PER_CLUSTER,
+            MIN_CENTROIDS_PER_PARENT_CLUSTER,
+            DenseVectorFieldMapper.ElementType.FLOAT,
+            false,
+            null,
+            1,
+            false,
+            DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+            0,
+            null
+        );
+        IndexWriterConfig iwc = newIndexWriterConfig();
+        iwc.setCodec(TestUtil.alwaysKnnVectorsFormat(localFormat));
+        float[][] vectors = new float[numDocs][];
+        try (Directory dir = newDirectory(); IndexWriter w = new IndexWriter(dir, iwc)) {
+            for (int i = 0; i < numDocs; i++) {
+                vectors[i] = scaledRandomVector(dimensions, similarity);
+                Document doc = new Document();
+                doc.add(new KnnFloatVectorField(vectorField, vectors[i], similarity));
+                doc.add(new StoredField(idField, i));
+                w.addDocument(doc);
+            }
+            w.commit();
+            try (IndexReader reader = DirectoryReader.open(w)) {
+                for (LeafReaderContext context : reader.leaves()) {
+                    assertResidualRerankSharpensScores(context.reader(), vectorField, idField, vectors, dimensions, similarity);
+                }
+            }
+            w.forceMerge(1);
+            try (IndexReader reader = DirectoryReader.open(w)) {
+                assertThat(reader.leaves(), hasSize(1));
+                assertResidualRerankSharpensScores(reader.leaves().get(0).reader(), vectorField, idField, vectors, dimensions, similarity);
+            }
+        }
+    }
+
+    /** With residual reranking turned off on the format, segments hold no residual codes and still search correctly. */
+    public void testResidualRerankCanBeDisabled() throws IOException {
+        String vectorField = "vector";
+        int numDocs = random().nextInt(100, 300);
+        int dimensions = random().nextInt(16, 64);
+        ESNextDiskBBQVectorsFormat localFormat = new ESNextDiskBBQVectorsFormat(
+            QuantEncoding.ONE_BIT_4BIT_QUERY,
+            MIN_VECTORS_PER_CLUSTER,
+            MIN_CENTROIDS_PER_PARENT_CLUSTER,
+            DenseVectorFieldMapper.ElementType.FLOAT,
+            false,
+            null,
+            1,
+            false,
+            DEFAULT_PRECONDITIONING_BLOCK_DIMENSION,
+            0,
+            null,
+            IvfFlushConfigSource.empty(),
+            IvfMergeConfigResolver.useCodecDefault(),
+            false,
+            false
+        );
+        IndexWriterConfig iwc = newIndexWriterConfig();
+        iwc.setCodec(TestUtil.alwaysKnnVectorsFormat(localFormat));
+        try (Directory dir = newDirectory(); IndexWriter w = new IndexWriter(dir, iwc)) {
+            for (int i = 0; i < numDocs; i++) {
+                Document doc = new Document();
+                float[] vector = scaledRandomVector(dimensions, VectorSimilarityFunction.EUCLIDEAN);
+                doc.add(new KnnFloatVectorField(vectorField, vector, VectorSimilarityFunction.EUCLIDEAN));
+                w.addDocument(doc);
+            }
+            w.commit();
+            w.forceMerge(1);
+            try (IndexReader reader = DirectoryReader.open(w)) {
+                for (LeafReaderContext context : reader.leaves()) {
+                    LeafReader leafReader = context.reader();
+                    assertFalse(esNextReader(leafReader, vectorField).hasResidualCodes(vectorField));
+                    float[] query = scaledRandomVector(dimensions, VectorSimilarityFunction.EUCLIDEAN);
+                    KnnCollector collector = new TopKnnCollector(10, Integer.MAX_VALUE);
+                    leafReader.searchNearestVectors(vectorField, query, collector, AcceptDocs.fromLiveDocs(null, leafReader.maxDoc()));
+                    assertThat(collector.topDocs().scoreDocs, arrayWithSize(10));
+                }
+            }
+        }
+    }
+
+    private static ESNextDiskBBQVectorsReader esNextReader(LeafReader leafReader, String vectorField) throws IOException {
+        KnnVectorsReader vectorReader = ((CodecReader) leafReader).getVectorReader();
+        if (vectorReader instanceof PerFieldKnnVectorsFormat.FieldsReader fieldsReader) {
+            vectorReader = fieldsReader.getFieldReader(vectorField);
+        }
+        assertThat(vectorReader, instanceOf(ESNextDiskBBQVectorsReader.class));
+        return (ESNextDiskBBQVectorsReader) vectorReader;
+    }
+
+    private static void assertResidualRerankSharpensScores(
+        LeafReader leafReader,
+        String vectorField,
+        String idField,
+        float[][] vectors,
+        int dimensions,
+        VectorSimilarityFunction similarity
+    ) throws IOException {
+        ESNextDiskBBQVectorsReader esNextReader = esNextReader(leafReader, vectorField);
+        assertTrue("float segments must store residual codes", esNextReader.hasResidualCodes(vectorField));
+        for (int q = 0; q < 5; q++) {
+            float[] query = scaledRandomVector(dimensions, similarity);
+            esNextReader.refineWithResiduals = false;
+            double coarseError = meanAbsoluteScoreError(leafReader, vectorField, idField, query, vectors, similarity);
+            esNextReader.refineWithResiduals = true;
+            double refinedError = meanAbsoluteScoreError(leafReader, vectorField, idField, query, vectors, similarity);
+            assertThat(
+                "refined error " + refinedError + " should be well below coarse error " + coarseError,
+                refinedError,
+                lessThan(0.5 * coarseError)
+            );
+        }
+    }
+
+    /** Mean absolute difference between the scores the IVF search returns and the exact similarity, over all returned docs. */
+    private static double meanAbsoluteScoreError(
+        LeafReader leafReader,
+        String vectorField,
+        String idField,
+        float[] query,
+        float[][] vectors,
+        VectorSimilarityFunction similarity
+    ) throws IOException {
+        KnnCollector collector = new TopKnnCollector(leafReader.maxDoc(), Integer.MAX_VALUE);
+        leafReader.searchNearestVectors(vectorField, query, collector, AcceptDocs.fromLiveDocs(null, leafReader.maxDoc()));
+        ScoreDoc[] scoreDocs = collector.topDocs().scoreDocs;
+        assertThat(scoreDocs.length, greaterThan(0));
+        double error = 0;
+        for (ScoreDoc scoreDoc : scoreDocs) {
+            int id = leafReader.storedFields().document(scoreDoc.doc).getField(idField).numericValue().intValue();
+            error += Math.abs(scoreDoc.score - similarity.compare(query, vectors[id]));
+        }
+        return error / scoreDocs.length;
+    }
+
+    /** Unit vectors for dot product, otherwise vectors of roughly unit norm so distances and scores stay in a useful range. */
+    private static float[] scaledRandomVector(int dimensions, VectorSimilarityFunction similarity) {
+        float[] vector = new float[dimensions];
+        double norm = 0;
+        for (int i = 0; i < dimensions; i++) {
+            vector[i] = random().nextFloat() * 2f - 1f;
+            norm += (double) vector[i] * vector[i];
+        }
+        double divisor = similarity == VectorSimilarityFunction.DOT_PRODUCT ? Math.sqrt(norm) : Math.sqrt(dimensions);
+        float scale = (float) (1 / divisor);
+        for (int i = 0; i < dimensions; i++) {
+            vector[i] *= scale;
+        }
+        return vector;
     }
 
     public void testSlicesDense() throws IOException {

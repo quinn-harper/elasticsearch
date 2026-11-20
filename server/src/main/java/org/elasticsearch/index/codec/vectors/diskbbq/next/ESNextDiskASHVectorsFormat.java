@@ -46,12 +46,16 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
     public static final String NAME = "ESNextDiskASHVectorsFormat";
     public static final String CENTROID_EXTENSION = "cenivf";
     public static final String CLUSTER_EXTENSION = "clivf";
+    /** Residual codes for reranking, in posting list order, kept apart from the posting lists so they cache separately. */
+    public static final String RESIDUAL_EXTENSION = "rivf";
     public static final String IVF_META_EXTENSION = "mivf";
 
     public static final int VERSION_START = 1;
     public static final int VERSION_DIRECT_IO = VERSION_START;
     public static final int VERSION_ON_DISK_MERGE = VERSION_START;
-    public static final int VERSION_CURRENT = VERSION_START;
+    /** Posting lists carry residual codes for reranking and the field meta carries the residual codebook. */
+    public static final int VERSION_RESIDUAL_RERANK = 2;
+    public static final int VERSION_CURRENT = VERSION_RESIDUAL_RERANK;
     public static final float DYNAMIC_VISIT_RATIO = 0.0f;
 
     private static final DirectIOCapableFlatVectorsFormat float32VectorFormat = new DirectIOCapableLucene99FlatVectorsFormat(
@@ -99,6 +103,7 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
     private final String sliceField;
     private final IvfFlushConfigSource ivfFlushConfigSource;
     private final IvfMergeConfigResolver ivfMergeConfigResolver;
+    private final boolean residualRerank;
 
     /**
      * No-arg constructor for SPI. Segments describe their own configuration, so this only matters for writing, where it
@@ -159,6 +164,45 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
         IvfMergeConfigResolver ivfMergeConfigResolver,
         boolean onDiskMerge
     ) {
+        this(
+            ashConfigResolver,
+            vectorPerCluster,
+            centroidsPerParentCluster,
+            elementType,
+            useDirectIO,
+            mergingExecutorService,
+            maxMergingWorkers,
+            quantizerExecutorService,
+            flatVectorThreshold,
+            sliceField,
+            ivfFlushConfigSource,
+            ivfMergeConfigResolver,
+            onDiskMerge,
+            true
+        );
+    }
+
+    /**
+     * @param residualRerank whether fields store residual codes next to their ASH codes, so that searches refine candidate
+     *                       scores without reading the raw vectors. Off is only meant for benchmarking the ASH codes alone;
+     *                       segments written without residual codes stay readable either way.
+     */
+    public ESNextDiskASHVectorsFormat(
+        AshConfigResolver ashConfigResolver,
+        int vectorPerCluster,
+        int centroidsPerParentCluster,
+        DenseVectorFieldMapper.ElementType elementType,
+        boolean useDirectIO,
+        ExecutorService mergingExecutorService,
+        int maxMergingWorkers,
+        ExecutorService quantizerExecutorService,
+        int flatVectorThreshold,
+        String sliceField,
+        IvfFlushConfigSource ivfFlushConfigSource,
+        IvfMergeConfigResolver ivfMergeConfigResolver,
+        boolean onDiskMerge,
+        boolean residualRerank
+    ) {
         super(NAME);
         if (vectorPerCluster < MIN_VECTORS_PER_CLUSTER || vectorPerCluster > MAX_VECTORS_PER_CLUSTER) {
             throw new IllegalArgumentException(
@@ -202,6 +246,7 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
         this.sliceField = sliceField;
         this.ivfFlushConfigSource = ivfFlushConfigSource;
         this.ivfMergeConfigResolver = ivfMergeConfigResolver;
+        this.residualRerank = residualRerank;
     }
 
     @Override
@@ -222,7 +267,8 @@ public class ESNextDiskASHVectorsFormat extends KnnVectorsFormat {
             sliceField,
             ivfFlushConfigSource,
             ivfMergeConfigResolver,
-            ashConfigResolver
+            ashConfigResolver,
+            residualRerank
         );
     }
 

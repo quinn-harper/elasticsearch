@@ -59,6 +59,7 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
     private final List<FieldWriter> fieldWriters = new ArrayList<>();
     private final IndexOutput ivfCentroids, ivfClusters;
     private final IndexOutput ivfMeta;
+    private final IndexOutput ivfResiduals;
     private final String rawVectorFormatName;
     private final Boolean useDirectIOReads;
     private final boolean onDiskMerge;
@@ -76,7 +77,6 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
     }
 
     /** @param shouldWriteOnDiskMerge whether this codec version records {@code onDiskMerge} in the meta */
-    @SuppressWarnings("this-escape")
     protected IVFVectorsWriter(
         SegmentWriteState state,
         String rawVectorFormatName,
@@ -91,6 +91,46 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         int flatVectorThreshold,
         boolean onDiskMerge,
         boolean shouldWriteOnDiskMerge
+    ) throws IOException {
+        this(
+            state,
+            rawVectorFormatName,
+            useDirectIOReads,
+            rawVectorDelegate,
+            writeVersion,
+            codecName,
+            metaExtension,
+            centroidExtension,
+            clusterExtension,
+            shouldWriteDirectIoReads,
+            flatVectorThreshold,
+            onDiskMerge,
+            shouldWriteOnDiskMerge,
+            null
+        );
+    }
+
+    /**
+     * @param shouldWriteOnDiskMerge whether this codec version records {@code onDiskMerge} in the meta
+     * @param residualExtension      extension of the file that holds residual codes for reranking, or {@code null} when this
+     *                               codec version writes none; see {@link #residualOutput()}
+     */
+    @SuppressWarnings("this-escape")
+    protected IVFVectorsWriter(
+        SegmentWriteState state,
+        String rawVectorFormatName,
+        Boolean useDirectIOReads,
+        FlatVectorsWriter rawVectorDelegate,
+        int writeVersion,
+        String codecName,
+        String metaExtension,
+        String centroidExtension,
+        String clusterExtension,
+        boolean shouldWriteDirectIoReads,
+        int flatVectorThreshold,
+        boolean onDiskMerge,
+        boolean shouldWriteOnDiskMerge,
+        String residualExtension
     ) throws IOException {
         this.rawVectorFormatName = rawVectorFormatName;
         this.onDiskMerge = onDiskMerge;
@@ -110,10 +150,30 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
             CodecUtil.writeIndexHeader(ivfCentroids, codecName, writeVersion, state.segmentInfo.getId(), state.segmentSuffix);
             ivfClusters = state.directory.createOutput(ivfClustersFileName, state.context);
             CodecUtil.writeIndexHeader(ivfClusters, codecName, writeVersion, state.segmentInfo.getId(), state.segmentSuffix);
+            if (residualExtension != null) {
+                final String ivfResidualsFileName = IndexFileNames.segmentFileName(
+                    state.segmentInfo.name,
+                    state.segmentSuffix,
+                    residualExtension
+                );
+                ivfResiduals = state.directory.createOutput(ivfResidualsFileName, state.context);
+                CodecUtil.writeIndexHeader(ivfResiduals, codecName, writeVersion, state.segmentInfo.getId(), state.segmentSuffix);
+            } else {
+                ivfResiduals = null;
+            }
         } catch (Throwable t) {
             IOUtils.closeWhileHandlingException(this);
             throw t;
         }
+    }
+
+    /**
+     * The file that holds the residual codes for reranking, or {@code null} when this codec version writes none. Codec
+     * versions that write residual codes append each field's codes here, in posting list order, while writing that
+     * field's posting lists, and record the field's region in their meta.
+     */
+    protected final IndexOutput residualOutput() {
+        return ivfResiduals;
     }
 
     @Override
@@ -978,11 +1038,14 @@ public abstract class IVFVectorsWriter<CI> extends KnnVectorsWriter {
         if (ivfClusters != null) {
             CodecUtil.writeFooter(ivfClusters);
         }
+        if (ivfResiduals != null) {
+            CodecUtil.writeFooter(ivfResiduals);
+        }
     }
 
     @Override
     public final void close() throws IOException {
-        IOUtils.close(rawVectorDelegate, ivfMeta, ivfCentroids, ivfClusters);
+        IOUtils.close(rawVectorDelegate, ivfMeta, ivfCentroids, ivfClusters, ivfResiduals);
     }
 
     @Override

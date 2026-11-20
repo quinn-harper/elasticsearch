@@ -26,6 +26,7 @@ import org.elasticsearch.index.codec.vectors.diskbbq.DocIdsWriter;
 import org.elasticsearch.index.codec.vectors.diskbbq.IntSorter;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
 import org.elasticsearch.index.codec.vectors.diskbbq.OverspillAssignments;
+import org.elasticsearch.index.codec.vectors.diskbbq.PooledLloydMaxQuantizer;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.simdvec.ESVectorUtil;
@@ -66,6 +67,7 @@ public class AshPostingsListWriter {
     private static final int ENCODE_SIZE = BULK_SIZE * 4;
 
     private AshProjectionMatrix ashProjectionMatrix;
+    private PooledLloydMaxQuantizer residualQuantizer;
 
     /**
      * Returns the projection matrix trained during the most recent
@@ -73,6 +75,15 @@ public class AshPostingsListWriter {
      */
     public AshProjectionMatrix getAshProjectionMatrix() {
         return ashProjectionMatrix;
+    }
+
+    /**
+     * Returns the residual quantizer fitted during the most recent {@link #buildAndWrite} call, which decodes the residual
+     * codes written to the residual output, or null if not yet called, no residual output was given, or the segment had
+     * no vectors.
+     */
+    public PooledLloydMaxQuantizer getResidualQuantizer() {
+        return residualQuantizer;
     }
 
     /**
@@ -93,6 +104,9 @@ public class AshPostingsListWriter {
      * @param useMergeTrainingFactor selects the training-sample factor, the sample size as a multiple of the vector
      *        dimension: {@code true} uses the configuration's {@code trainingFactor} (merge), {@code false}
      *        its {@code flushTrainingFactor}. Both currently have the same default.
+     * @param residualOutput where the residual codes go, {@code originalDim} bytes per vector in posting list order, with
+     *        each posting list header recording where its vectors' codes start relative to the output's position on
+     *        entry; or {@code null} to fit no residual quantizer, in which case {@link #getResidualQuantizer()} is null.
      */
     public PostingsOffsetAndLength buildAndWrite(
         FieldInfo fieldInfo,
@@ -107,11 +121,13 @@ public class AshPostingsListWriter {
         VectorSimilarityFunction similarityFunction,
         boolean skipDocIds,
         AshProjectionMatrix inherited,
-        boolean useMergeTrainingFactor
+        boolean useMergeTrainingFactor,
+        IndexOutput residualOutput
     ) throws IOException {
         int nVectors = assignments.length;
         int originalDim = fieldInfo.getVectorDimension();
         int nClusters = centroidSupplier.size();
+        final long residualFileOffset = residualOutput == null ? 0 : residualOutput.getFilePointer();
 
         // Vector access for training and encoding. Read directly from the supplied vectors by
         // ordinal rather than cloning the whole corpus on-heap:
@@ -159,6 +175,11 @@ public class AshPostingsListWriter {
         // marked learned=false so that merge does not inherit it.
         this.ashProjectionMatrix = trained.matrix();
 
+        // The residual quantizer is fit on what the ASH codes leave behind, so it needs the final W and the same encoder.
+        this.residualQuantizer = residualOutput != null
+            ? trainResidualQuantizer(vectors, ashQuantizer, trained.w(), trained.wT(), originalDim, centroidGetter, nVectors, quantizerExec)
+            : null;
+
         // Build cluster-to-vector mappings, counting primary + SOAR overspill assignments
         ClusterAssignmentBuilder clusterAssignments = ClusterAssignmentBuilder.build(assignments, overspillAssignments, nClusters);
 
@@ -176,8 +197,124 @@ public class AshPostingsListWriter {
             fileOffset,
             ashConfig,
             similarityFunction,
-            skipDocIds
+            skipDocIds,
+            residualQuantizer,
+            residualOutput,
+            residualFileOffset,
+            quantizerExec
         );
+    }
+
+    /**
+     * Fits the residual quantizer on a strided sample of the vectors. Each sample is centered on its own primary centroid and
+     * encoded exactly as the posting lists encode it; the residual is the centered vector minus its reconstruction from the
+     * codes. The offsets the encoder derives depend on the posting list centroid, but the codes and scales do not, so one
+     * precomputed centroid serves the whole sample block.
+     */
+    private static PooledLloydMaxQuantizer trainResidualQuantizer(
+        CheckedIntFunction<float[], IOException> vectors,
+        AsymmetricHashingQuantizer ashQuantizer,
+        float[] w,
+        float[] wT,
+        int originalDim,
+        CheckedIntFunction<float[], IOException> centroidGetter,
+        int nVectors,
+        TaskExecutor executor
+    ) throws IOException {
+        if (nVectors == 0) {
+            return null;
+        }
+        final int sampleSize = PooledLloydMaxQuantizer.trainingSampleSize(nVectors, originalDim);
+        final int stride = Math.max(1, nVectors / sampleSize);
+        final PooledLloydMaxQuantizer.Trainer trainer = new PooledLloydMaxQuantizer.Trainer(originalDim);
+        final ResidualBlockComputer residuals = new ResidualBlockComputer(wT, originalDim, ENCODE_SIZE, executor);
+        final float[] residual = new float[originalDim];
+        try (AsymmetricHashingQuantizer.BlockEncoder encoder = ashQuantizer.newBlockEncoder(w, originalDim, ENCODE_SIZE)) {
+            int ord = 0;
+            int collected = 0;
+            while (collected < sampleSize && ord < nVectors) {
+                encoder.reset();
+                int rows = 0;
+                AsymmetricHashingQuantizer.VectorAndNorm precomputed = null;
+                while (rows < ENCODE_SIZE && collected < sampleSize && ord < nVectors) {
+                    float[] centroid = centroidGetter.apply(ord);
+                    if (precomputed == null) {
+                        precomputed = AsymmetricHashingQuantizer.precomputeCentroid(centroid, wT);
+                    }
+                    float[] vec = vectors.apply(ord);
+                    encoder.add(vec, centroid);
+                    residuals.addCentered(rows, vec, centroid);
+                    rows++;
+                    collected++;
+                    ord += stride;
+                }
+                encoder.encode(precomputed);
+                residuals.reconstruct(encoder);
+                for (int i = 0; i < rows; i++) {
+                    residuals.residual(i, residual);
+                    trainer.add(residual);
+                }
+            }
+        }
+        return trainer.fit();
+    }
+
+    /**
+     * Computes the residuals of an encoder block: the centered vectors gathered alongside the encoder minus their
+     * reconstruction {@code scale * (W code)}, done for the whole block in one matrix multiply so W is read once per block.
+     */
+    static final class ResidualBlockComputer {
+        private final float[] wT;
+        private final int originalDim;
+        private final int nDims;
+        private final int maxBlockSize;
+        private final TaskExecutor executor;
+        private final float[] centered;
+        private final float[] scaledCodes;
+        private final float[] reconstructed;
+
+        ResidualBlockComputer(float[] wT, int originalDim, int maxBlockSize, TaskExecutor executor) {
+            this.wT = wT;
+            this.originalDim = originalDim;
+            this.nDims = wT.length / originalDim;
+            this.maxBlockSize = maxBlockSize;
+            this.executor = executor;
+            this.centered = new float[maxBlockSize * originalDim];
+            this.scaledCodes = new float[maxBlockSize * nDims];
+            this.reconstructed = new float[maxBlockSize * originalDim];
+        }
+
+        /** Records {@code vector - centroid} as row {@code row}; both arrays may be reused by the caller afterwards. */
+        void addCentered(int row, float[] vector, float[] centroid) {
+            final int base = row * originalDim;
+            for (int d = 0; d < originalDim; d++) {
+                centered[base + d] = vector[d] - centroid[d];
+            }
+        }
+
+        /** Reconstructs every encoded row of the block from its scale and codes; call after {@code encoder.encode}. */
+        void reconstruct(AsymmetricHashingQuantizer.BlockEncoder encoder) {
+            final int size = encoder.size();
+            for (int i = 0; i < size; i++) {
+                final float scale = encoder.scale(i);
+                final float[] code = encoder.code(i);
+                final int base = i * nDims;
+                for (int j = 0; j < nDims; j++) {
+                    scaledCodes[base + j] = scale * code[j];
+                }
+            }
+            // round the rows up to the next multiple of 8 so the matrix multiply does not deal with row tails;
+            // the extra rows hold stale values whose results are never read
+            final int roundedSize = Math.min(maxBlockSize, (size + 7) & ~7);
+            ESVectorUtil.matrixMultiply(scaledCodes, wT, roundedSize, nDims, originalDim, reconstructed, executor);
+        }
+
+        void residual(int row, float[] destination) {
+            final int base = row * originalDim;
+            for (int d = 0; d < originalDim; d++) {
+                destination[d] = centered[base + d] - reconstructed[base + d];
+            }
+        }
     }
 
     /**
@@ -197,7 +334,11 @@ public class AshPostingsListWriter {
         long fileOffset,
         IvfSegmentConfig.AshConfig ashConfig,
         VectorSimilarityFunction similarityFunction,
-        boolean skipDocIds
+        boolean skipDocIds,
+        PooledLloydMaxQuantizer residualQuantizer,
+        IndexOutput residualOutput,
+        long residualFileOffset,
+        TaskExecutor executor
     ) throws IOException {
         int nClusters = assignmentsByCluster.length;
         int nDims = w.length / originalDim;
@@ -210,9 +351,15 @@ public class AshPostingsListWriter {
         final int[] docDeltas = new int[maxPostingListSize];
         final int[] clusterOrds = new int[maxPostingListSize];
         // Pre-allocated bulk block buffers.
-        // Codes are written contiguously, then corrections in SoA layout per field.
+        // Codes are written contiguously, then corrections in SoA layout per field; residual codes go to their own output.
         final byte[] blockCodesBuf = new byte[BULK_SIZE * packedCodeBytes];
         final byte[] blockCorrectionsBuf = new byte[BULK_SIZE * AshPostingsVisitor.CORRECTION_BYTES];
+        final int residualLength = residualQuantizer == null ? 0 : originalDim;
+        final byte[] blockResidualsBuf = new byte[BULK_SIZE * residualLength];
+        final ResidualBlockComputer residuals = residualQuantizer == null
+            ? null
+            : new ResidualBlockComputer(wT, originalDim, ENCODE_SIZE, executor);
+        final float[] residual = new float[residualLength];
         final boolean isEuclidean = similarityFunction == VectorSimilarityFunction.EUCLIDEAN;
         final float[] blockVecCentroidSqDists = new float[ENCODE_SIZE];
         DocIdsWriter idsWriter = new DocIdsWriter();
@@ -243,6 +390,9 @@ public class AshPostingsListWriter {
                 postingsOutput.writeVInt(c);
                 float centroidNormSq = isEuclidean ? ESVectorUtil.dotProduct(centroid, centroid) : 0f;
                 postingsOutput.writeInt(Float.floatToIntBits(centroidNormSq));
+                if (residualQuantizer != null) {
+                    postingsOutput.writeVLong(residualOutput.getFilePointer() - residualFileOffset);
+                }
 
                 // Sort by docId
                 for (int j = 0; j < size; j++) {
@@ -263,6 +413,8 @@ public class AshPostingsListWriter {
                 // [docIds][packed_codes × blockSize]
                 // [scales × blockSize][offsets × blockSize][docSums × blockSize]
                 // [vecCentroidDots × blockSize][vecCentroidSqDists × blockSize]
+                // Residual codes (one byte per original dimension, only when a residual quantizer was fit) go to the
+                // residual output in the same vector order, never into the posting list.
                 // When skipDocIds is true (sliced flush), doc IDs are omitted -- the reader uses ordToDoc().
                 int written = 0;
                 int encodeOffset = ENCODE_SIZE;
@@ -277,11 +429,17 @@ public class AshPostingsListWriter {
                             int vectorOrd = cluster[clusterOrds[written + j]];
                             float[] vec = vectors.apply(vectorOrd);
                             encoder.add(vec, centroid);
+                            if (residuals != null) {
+                                residuals.addCentered(j, vec, centroid);
+                            }
                             if (isEuclidean) {
                                 blockVecCentroidSqDists[j] = ESVectorUtil.squareDistance(vec, centroid);
                             }
                         }
                         encoder.encode(precomputed);
+                        if (residuals != null) {
+                            residuals.reconstruct(encoder);
+                        }
                         encodeOffset = 0;
                     }
 
@@ -332,10 +490,17 @@ public class AshPostingsListWriter {
                             BitUtil.VH_BE_INT.set(blockCorrectionsBuf, vcdBase + jOff, 0);
                             BitUtil.VH_BE_INT.set(blockCorrectionsBuf, vcsdBase + jOff, 0);
                         }
+                        if (residuals != null) {
+                            residuals.residual(encodeOffset + j, residual);
+                            residualQuantizer.encode(residual, blockResidualsBuf, j * residualLength);
+                        }
                     }
-                    // Write packed codes, then all corrections in one call
+                    // Write packed codes, then all corrections in one call; the residual codes go to their own output
                     postingsOutput.writeBytes(blockCodesBuf, 0, blockSize * packedCodeBytes);
                     postingsOutput.writeBytes(blockCorrectionsBuf, 0, blockSize * AshPostingsVisitor.CORRECTION_BYTES);
+                    if (residuals != null) {
+                        residualOutput.writeBytes(blockResidualsBuf, 0, blockSize * residualLength);
+                    }
                     written += blockSize;
                     encodeOffset += blockSize;
                 }

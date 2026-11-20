@@ -9,10 +9,15 @@
 
 package org.elasticsearch.search.vectors;
 
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.lucene95.HasIndexSlice;
+import org.apache.lucene.codecs.perfield.PerFieldKnnVectorsFormat;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.KnnVectorValues;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.queries.function.FunctionScoreQuery;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.ConjunctionUtils;
@@ -30,7 +35,9 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
+import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualRescoringReader;
 import org.elasticsearch.lucene.store.ThreadConfinedArena;
 import org.elasticsearch.search.profile.query.QueryProfiler;
 
@@ -416,6 +423,10 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
                 if (fieldInfo == null) {
                     continue;
                 }
+                if (hasResidualCodes(leaf.reader(), fieldName)) {
+                    keepInnerScores(indexSearcher, innerRewritten, leaf, results);
+                    continue;
+                }
                 KnnVectorValues knnVectorValues;
                 if (target instanceof VectorQueryTarget.ByteTarget) {
                     knnVectorValues = leaf.reader().getByteVectorValues(fieldName);
@@ -470,6 +481,44 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             }
 
             return new KnnScoreDocQuery(results.toArray(ScoreDoc[]::new), indexSearcher.getIndexReader());
+        }
+
+        /**
+         * Whether the segment's vector reader for {@code fieldName} already refines its approximate scores with residual
+         * codes stored next to the quantized vectors, in which case the raw vectors add nothing and are not read.
+         */
+        private static boolean hasResidualCodes(LeafReader leafReader, String fieldName) {
+            SegmentReader segmentReader = Lucene.tryUnwrapSegmentReader(leafReader);
+            if (segmentReader == null) {
+                return false;
+            }
+            KnnVectorsReader vectorsReader = segmentReader.getVectorReader();
+            if (vectorsReader instanceof PerFieldKnnVectorsFormat.FieldsReader perField) {
+                vectorsReader = perField.getFieldReader(fieldName);
+            }
+            return vectorsReader instanceof ResidualRescoringReader residualReader && residualReader.hasResidualCodes(fieldName);
+        }
+
+        /**
+         * Carries the inner query's scores for a leaf into the results unchanged. The inner query is the approximate top
+         * docs query, whose scores for this leaf were already refined by the codec.
+         */
+        private static void keepInnerScores(
+            IndexSearcher indexSearcher,
+            Query innerRewritten,
+            LeafReaderContext leaf,
+            List<ScoreDoc> results
+        ) throws IOException {
+            var weight = innerRewritten.createWeight(indexSearcher, ScoreMode.COMPLETE, 1.0f);
+            var scorer = weight.scorer(leaf);
+            if (scorer == null) {
+                return;
+            }
+            var iterator = scorer.iterator();
+            int doc;
+            while ((doc = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                results.add(new ScoreDoc(doc + leaf.docBase, scorer.score()));
+            }
         }
 
         private static IndexInput getIndexSliceOrNull(KnnVectorValues vectorValues) {

@@ -9,6 +9,7 @@
 
 package org.elasticsearch.index.codec.vectors.diskbbq.next;
 
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.SegmentReadState;
@@ -34,10 +35,14 @@ import org.elasticsearch.index.codec.vectors.diskbbq.FlatCentroidIndex;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader.QueryTarget;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfAutoCalibration;
+import org.elasticsearch.index.codec.vectors.diskbbq.PooledLloydMaxQuantizer;
 import org.elasticsearch.index.codec.vectors.diskbbq.PostingMetadata;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
 import org.elasticsearch.index.codec.vectors.diskbbq.QuantEncoding;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualCodesMeta;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualRescoringReader;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualScoreRefiner;
 import org.elasticsearch.index.codec.vectors.diskbbq.SegmentCalibrationParameters;
 import org.elasticsearch.index.codec.vectors.diskbbq.SlicedBlockRange;
 import org.elasticsearch.index.codec.vectors.diskbbq.VectorPreconditioner;
@@ -64,7 +69,8 @@ import static org.elasticsearch.simdvec.ES940OSQVectorsScorer.BULK_SIZE;
 public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVectorsReader.NextFieldEntry>
     implements
         VectorPreconditioner,
-        CalibrationAwareReader {
+        CalibrationAwareReader,
+        ResidualRescoringReader {
 
     public ESNextDiskBBQVectorsReader(SegmentReadState state, GenericFlatVectorReaders.LoadFlatVectorsReader getFormatReader)
         throws IOException {
@@ -79,7 +85,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             ESNextDiskBBQVectorsFormat.VERSION_CURRENT,
             ESNextDiskBBQVectorsFormat.VERSION_DIRECT_IO,
             ESNextDiskBBQVectorsFormat.VERSION_ON_DISK_MERGE,
-            ESNextDiskBBQVectorsFormat.DYNAMIC_VISIT_RATIO
+            ESNextDiskBBQVectorsFormat.DYNAMIC_VISIT_RATIO,
+            ESNextDiskBBQVectorsFormat.RESIDUAL_EXTENSION,
+            ESNextDiskBBQVectorsFormat.VERSION_RESIDUAL_RERANK
         );
     }
 
@@ -210,6 +218,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         float rescoreOversample = Float.intBitsToFloat(input.readInt());
         // ESNext format extension: byte centroid flag
         boolean byteCentroids = input.readByte() == 1;
+        ResidualCodesMeta residualCodes = readResidualCodesMeta(input, versionMeta, globalCentroid.length);
         return new NextFieldEntry(
             rawVectorFormat,
             useDirectIOReads,
@@ -230,8 +239,31 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             numSlices,
             maxSliceSize,
             rescoreOversample,
-            byteCentroids
+            byteCentroids,
+            residualCodes
         );
+    }
+
+    /**
+     * Reads the residual codes description at the end of the field meta, or returns {@code null} for segments without
+     * residual codes, including those written before the residual file existed. Shared with the ASH reader so both
+     * ESNext formats parse the field meta the same way.
+     */
+    static ResidualCodesMeta readResidualCodesMeta(IndexInput input, int versionMeta, int dimension) throws IOException {
+        if (versionMeta < ESNextDiskBBQVectorsFormat.VERSION_RESIDUAL_RERANK) {
+            return null;
+        }
+        return ResidualCodesMeta.read(input, dimension);
+    }
+
+    @Override
+    public boolean hasResidualCodes(String field) {
+        final FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+        if (fieldInfo == null) {
+            return false;
+        }
+        final NextFieldEntry entry = fields.get(fieldInfo.number);
+        return entry != null && entry.residualCodes() != null && entry.numCentroids() > 0;
     }
 
     @Override
@@ -352,6 +384,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final int maxSliceSize;
         private final float rescoreOversample;
         private final boolean byteCentroids;
+        private final ResidualCodesMeta residualCodes;
 
         NextFieldEntry(
             String rawVectorFormat,
@@ -375,6 +408,54 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             float rescoreOversample,
             boolean byteCentroids
         ) {
+            this(
+                rawVectorFormat,
+                doDirectIOReads,
+                similarityFunction,
+                vectorEncoding,
+                numCentroids,
+                centroidOffset,
+                centroidLength,
+                postingListOffset,
+                postingListLength,
+                globalCentroid,
+                globalCentroidDp,
+                centroidIndexFormat,
+                quantEncoding,
+                bulkSize,
+                preconditionerOffset,
+                preconditionerLength,
+                numSlices,
+                maxSliceSize,
+                rescoreOversample,
+                byteCentroids,
+                null
+            );
+        }
+
+        NextFieldEntry(
+            String rawVectorFormat,
+            boolean doDirectIOReads,
+            VectorSimilarityFunction similarityFunction,
+            VectorEncoding vectorEncoding,
+            int numCentroids,
+            long centroidOffset,
+            long centroidLength,
+            long postingListOffset,
+            long postingListLength,
+            float[] globalCentroid,
+            float globalCentroidDp,
+            CentroidIndexFormat centroidIndexFormat,
+            QuantEncoding quantEncoding,
+            int bulkSize,
+            long preconditionerOffset,
+            long preconditionerLength,
+            int numSlices,
+            int maxSliceSize,
+            float rescoreOversample,
+            boolean byteCentroids,
+            ResidualCodesMeta residualCodes
+        ) {
             super(
                 rawVectorFormat,
                 doDirectIOReads,
@@ -397,10 +478,21 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             this.maxSliceSize = maxSliceSize;
             this.rescoreOversample = rescoreOversample;
             this.byteCentroids = byteCentroids;
+            this.residualCodes = residualCodes;
         }
 
         public CentroidIndexFormat centroidIndexFormat() {
             return centroidIndexFormat;
+        }
+
+        /** The residual codes this field stores for reranking, or {@code null} when it has none. */
+        public ResidualCodesMeta residualCodes() {
+            return residualCodes;
+        }
+
+        /** The quantizer decoding this field's residual codes, or {@code null} when it has none. */
+        public PooledLloydMaxQuantizer residualQuantizer() {
+            return residualCodes == null ? null : residualCodes.quantizer();
         }
 
         public QuantEncoding quantEncoding() {
@@ -446,7 +538,34 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         IndexInput centroidSlice,
         ESAcceptDocs acceptDocs
     ) throws IOException {
+        return getPostingVisitor(fieldInfo, values, indexInput, queryTarget, needsScoring, centroidSlice, acceptDocs, refineWithResiduals);
+    }
+
+    /**
+     * Whether searches refine competitive candidates with the stored residual codes. Always {@code true} in production;
+     * tests clear it to measure the coarse scores of the same segment through the regular search path.
+     */
+    // package-private for testing
+    boolean refineWithResiduals = true;
+
+    /**
+     * @param refineWithResiduals whether competitive candidates get their score refined with the stored residual codes
+     */
+    PostingVisitor getPostingVisitor(
+        FieldInfo fieldInfo,
+        KnnVectorValues values,
+        IndexInput indexInput,
+        QueryTarget queryTarget,
+        Bits needsScoring,
+        IndexInput centroidSlice,
+        ESAcceptDocs acceptDocs,
+        boolean refineWithResiduals
+    ) throws IOException {
         NextFieldEntry entry = fields.get(fieldInfo.number);
+        final ResidualScoreRefiner residualRefiner = entry.residualQuantizer() == null
+            ? null
+            : new ResidualScoreRefiner(fieldInfo.getVectorSimilarityFunction(), entry.residualQuantizer());
+        final IndexInput residualInput = entry.residualCodes() == null ? null : entry.residualCodes().slice(ivfResiduals);
         // Extract float target for QueryQuantizer (byte queries are widened at the search entry point)
         float[] target = switch (queryTarget) {
             case QueryTarget.FloatQuery fq -> fq.vector();
@@ -483,9 +602,9 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 centroidSlice.getFilePointer(),
                 (long) numParents * fieldInfo.getVectorDimension() * Float.BYTES
             );
-            queryQuantizer = new QueryQuantizer(quantEncoding, fieldInfo, target, parentsSlice, entry.globalCentroid());
+            queryQuantizer = new QueryQuantizer(quantEncoding, fieldInfo, target, parentsSlice, entry.globalCentroid(), residualRefiner);
         } else {
-            queryQuantizer = new QueryQuantizer(quantEncoding, fieldInfo, target, null, entry.globalCentroid());
+            queryQuantizer = new QueryQuantizer(quantEncoding, fieldInfo, target, null, entry.globalCentroid(), residualRefiner);
         }
         if (entry.numSlices == 0) {
             // Sliced segment without per-slice centroid structure (e.g. byte fields during flush).
@@ -510,17 +629,39 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 entry,
                 fieldInfo,
                 needsScoring,
+                residualRefiner,
+                residualInput,
+                refineWithResiduals,
                 values,
                 startDoc,
                 endDoc
             );
 
         } else {
-            return new MemorySegmentPostingsVisitor(queryQuantizer, quantEncoding, indexInput, entry, fieldInfo, needsScoring);
+            return new MemorySegmentPostingsVisitor(
+                queryQuantizer,
+                quantEncoding,
+                indexInput,
+                entry,
+                fieldInfo,
+                needsScoring,
+                residualRefiner,
+                residualInput,
+                refineWithResiduals
+            );
         }
     }
 
-    private record QueryQuantizerResult(OptimizedScalarQuantizer.QuantizationResult queryCorrections, ScoringQuery quantizedTarget) {}
+    /**
+     * @param scaledQuery the centered query multiplied by the residual quantizer's per dimension scales, cached here so
+     *                    that it stays valid on cache hits, where the quantizer's scratch is not recomputed; {@code null}
+     *                    when the field has no residual codes
+     */
+    private record QueryQuantizerResult(
+        OptimizedScalarQuantizer.QuantizationResult queryCorrections,
+        ScoringQuery quantizedTarget,
+        float[] scaledQuery
+    ) {}
 
     private static final int QUERY_CACHE_SIZE = 16;
 
@@ -534,13 +675,21 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         private final IndexInput parentsSlice;
         private final float[] globalCentroid;
         private final float[] centroidScratch;
+        private final ResidualScoreRefiner residualRefiner;
 
         private int currentCentroidOrdinal = -2;
         private int nextCentroidOrdinal = -1;
         private byte[] evictedQuantizedQuery = null;
         private QueryQuantizerResult result = null;
 
-        QueryQuantizer(QuantEncoding quantEncoding, FieldInfo fieldInfo, float[] target, IndexInput parentsSlice, float[] globalCentroid) {
+        QueryQuantizer(
+            QuantEncoding quantEncoding,
+            FieldInfo fieldInfo,
+            float[] target,
+            IndexInput parentsSlice,
+            float[] globalCentroid,
+            ResidualScoreRefiner residualRefiner
+        ) {
             this.quantEncoding = quantEncoding;
             this.target = target;
             this.scratch = new float[fieldInfo.getVectorDimension()];
@@ -549,6 +698,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             this.quantizer = new OptimizedScalarQuantizer(fieldInfo.getVectorSimilarityFunction(), DEFAULT_LAMBDA, 1);
             this.parentsSlice = parentsSlice;
             this.globalCentroid = globalCentroid;
+            this.residualRefiner = residualRefiner;
 
             this.cache = new LinkedHashMap<>(QUERY_CACHE_SIZE, 0.75f, true) {
                 @Override
@@ -600,7 +750,13 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                 );
                 quantEncoding.packQuery(quantizationScratch, quantizedQuery);
                 currentCentroidOrdinal = nextCentroidOrdinal;
-                result = new QueryQuantizerResult(queryCorrections, new ScoringQuery(quantizedQuery));
+                float[] scaledQuery = null;
+                if (residualRefiner != null) {
+                    // scratch holds target - queryCentroid after scalarQuantize, the centered query the scorer estimates against
+                    scaledQuery = new float[scratch.length];
+                    residualRefiner.scaleQuery(scratch, scaledQuery);
+                }
+                result = new QueryQuantizerResult(queryCorrections, new ScoringQuery(quantizedQuery), scaledQuery);
                 cache.put(nextCentroidOrdinal, result);
             }
         }
@@ -612,12 +768,22 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         ScoringQuery getQuantizedTarget() {
             return result.quantizedTarget();
         }
+
+        /** The centered query scaled for the residual refiner, valid for the centroid last passed to {@link #reset}. */
+        float[] getScaledQuery() {
+            return result.scaledQuery();
+        }
     }
 
     @Override
     public Map<String, Long> getOffHeapByteSize(FieldInfo fieldInfo) {
-        // TODO: override if adding new files
-        return super.getOffHeapByteSize(fieldInfo);
+        final Map<String, Long> sizes = super.getOffHeapByteSize(fieldInfo);
+        final NextFieldEntry entry = fields.get(fieldInfo.number);
+        if (entry == null) {
+            return sizes;
+        }
+        final long residualLength = entry.residualCodes() == null ? 0L : entry.residualCodes().length();
+        return KnnVectorsReader.mergeOffHeapByteSizeMaps(sizes, Map.of(ESNextDiskBBQVectorsFormat.RESIDUAL_EXTENSION, residualLength));
     }
 
     /**
@@ -637,7 +803,8 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             new QueryTarget.FloatQuery(query),
             null,
             entry.centroidSlice(ivfCentroids.clone()),
-            acceptDocs
+            acceptDocs,
+            refineWithResiduals
         );
     }
 
@@ -653,11 +820,24 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             FieldEntry entry,
             FieldInfo fieldInfo,
             Bits acceptDocs,
+            ResidualScoreRefiner residualRefiner,
+            IndexInput residualInput,
+            boolean refineWithResiduals,
             KnnVectorValues values,
             int startDocId,
             int endDocId
         ) throws IOException {
-            super(queryQuantizer, quantEncoding, indexInput, entry, fieldInfo, acceptDocs);
+            super(
+                queryQuantizer,
+                quantEncoding,
+                indexInput,
+                entry,
+                fieldInfo,
+                acceptDocs,
+                residualRefiner,
+                residualInput,
+                refineWithResiduals
+            );
             this.startDocId = startDocId;
             this.endDocId = endDocId;
             this.vectorValues = values;
@@ -676,6 +856,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             );
             this.vectors = range.vectors();
             docBase = range.docBase();
+            blockOrdinalBase = range.docBase();
             slicePos += range.skipBytes();
             return this.vectors;
         }
@@ -735,21 +916,44 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
         final DocIdsWriter idsWriter = new DocIdsWriter();
         final VectorSimilarityFunction similarityFunction;
         final long quantizedVectorByteSize;
+        // bytes of residual codes per vector in the residual file; 0 when the segment stores none
+        final int residualLength;
+        private final ResidualScoreRefiner residualRefiner;
+        private final IndexInput residualInput;
+        private final boolean refineWithResiduals;
+        private final byte[] residualScratch;
+        // where the current posting list's residual codes start in the residual file
+        private long residualBase;
+        // posting list ordinal of the first vector of the first block visited, non zero only for sliced visits
+        int blockOrdinalBase;
 
+        /**
+         * @param residualRefiner refines competitive scores with the residual codes, {@code null} when the field has none
+         * @param residualInput   the field's region of the residual file, {@code null} exactly when the refiner is
+         */
         MemorySegmentPostingsVisitor(
             QueryQuantizer queryQuantizer,
             QuantEncoding quantEncoding,
             IndexInput indexInput,
             FieldEntry entry,
             FieldInfo fieldInfo,
-            Bits acceptDocs
+            Bits acceptDocs,
+            ResidualScoreRefiner residualRefiner,
+            IndexInput residualInput,
+            boolean refineWithResiduals
         ) throws IOException {
+            assert (residualRefiner == null) == (residualInput == null);
             this.queryQuantizer = queryQuantizer;
             this.indexInput = indexInput;
             this.similarityFunction = fieldInfo.getVectorSimilarityFunction();
             this.entry = entry;
             this.fieldInfo = fieldInfo;
             this.acceptDocs = acceptDocs;
+            this.residualRefiner = residualRefiner;
+            this.residualInput = residualInput;
+            this.refineWithResiduals = refineWithResiduals && residualRefiner != null;
+            this.residualLength = residualRefiner == null ? 0 : residualRefiner.dimension();
+            this.residualScratch = residualRefiner == null ? null : new byte[residualLength];
             quantizedVectorByteSize = quantEncoding.getDocPackedLength(fieldInfo.getVectorDimension());
             quantizedByteLength = quantizedVectorByteSize + (Float.BYTES * 3) + Integer.BYTES;
             osqVectorsScorer = ESVectorUtil.getES940OSQVectorsScorer(
@@ -771,8 +975,12 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             indexInput.seek(metadata.offset());
             centroidToParentSqDist = Float.intBitsToFloat(indexInput.readInt());
             vectors = indexInput.readVInt();
+            if (residualLength > 0) {
+                residualBase = indexInput.readVLong();
+            }
             docEncoding = indexInput.readByte();
             docBase = 0;
+            blockOrdinalBase = 0;
             slicePos = indexInput.getFilePointer();
             // The score is the transformed score used when searching the centroids.
             // we need to convert it back to the raw similarity to be used as part of
@@ -881,6 +1089,40 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
             }
         }
 
+        /**
+         * Refines the coarse scores of the block just scored with the residual codes of its vectors, read from the
+         * residual file, for the vectors that could still enter the collector. The residual file is only touched for
+         * those vectors, so a block with nothing competitive costs no residual read at all.
+         *
+         * @param blockStart posting list ordinal of the block's first vector, which locates its codes in the residual file
+         * @return the largest score of the block after refinement
+         */
+        private float refineBlock(KnnCollector knnCollector, int blockSize, int blockStart, float maxScore) throws IOException {
+            if (refineWithResiduals == false) {
+                return maxScore;
+            }
+            final float minCompetitive = knnCollector.minCompetitiveSimilarity();
+            if (minCompetitive >= maxScore) {
+                return maxScore;
+            }
+            residualRefiner.setScaledQuery(queryQuantizer.getScaledQuery());
+            maxScore = Float.NEGATIVE_INFINITY;
+            for (int j = 0; j < blockSize; j++) {
+                if (docIdsScratch[j] == -1) {
+                    continue;
+                }
+                if (scores[j] > minCompetitive) {
+                    residualInput.seek(residualBase + (long) (blockStart + j) * residualLength);
+                    residualInput.readBytes(residualScratch, 0, residualLength);
+                    scores[j] = residualRefiner.refineScore(scores[j], residualRefiner.delta(residualScratch, 0));
+                }
+                if (scores[j] > maxScore) {
+                    maxScore = scores[j];
+                }
+            }
+            return maxScore;
+        }
+
         @Override
         public int visit(KnnCollector knnCollector) throws IOException {
             indexInput.seek(slicePos);
@@ -899,7 +1141,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     continue;
                 }
                 queryQuantizer.quantizeQueryIfNecessary();
-                final float maxScore;
+                float maxScore;
                 if (docsToBulkScore == 1) {
                     maxScore = scoreIndividually(BULK_SIZE);
                 } else if (docsToBulkScore < BULK_SIZE) {
@@ -927,6 +1169,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                         scores
                     );
                 }
+                maxScore = refineBlock(knnCollector, BULK_SIZE, blockOrdinalBase + i, maxScore);
                 if (knnCollector.minCompetitiveSimilarity() < maxScore) {
                     collectBulk(knnCollector, scores, BULK_SIZE, mask, docsToBulkScore, maxScore);
                 }
@@ -942,7 +1185,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                     indexInput.skipBytes(quantizedByteLength * tailSize);
                 } else {
                     queryQuantizer.quantizeQueryIfNecessary();
-                    final float maxScore;
+                    float maxScore;
                     if (docsToBulkScore == 1) {
                         maxScore = scoreIndividually(tailSize);
                     } else if (docsToBulkScore < tailSize) {
@@ -971,6 +1214,7 @@ public class ESNextDiskBBQVectorsReader extends IVFVectorsReader<ESNextDiskBBQVe
                             tailSize
                         );
                     }
+                    maxScore = refineBlock(knnCollector, tailSize, blockOrdinalBase + i, maxScore);
                     if (knnCollector.minCompetitiveSimilarity() < maxScore) {
                         collectBulk(knnCollector, scores, tailSize, mask, docsToBulkScore, maxScore);
                     }

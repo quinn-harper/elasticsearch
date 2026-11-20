@@ -56,7 +56,9 @@ import org.elasticsearch.index.codec.vectors.diskbbq.IvfFlushConfigSource;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfMergeConfigResolver;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
 import org.elasticsearch.index.codec.vectors.diskbbq.OverspillAssignments;
+import org.elasticsearch.index.codec.vectors.diskbbq.PooledLloydMaxQuantizer;
 import org.elasticsearch.index.codec.vectors.diskbbq.Preconditioner;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualCodesMeta;
 import org.elasticsearch.index.codec.vectors.diskbbq.TieredMergeStrategy;
 import org.elasticsearch.logging.LogManager;
 import org.elasticsearch.logging.Logger;
@@ -83,9 +85,15 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
     private final IvfFlushConfigSource flushConfigSource;
     private final IvfMergeConfigResolver mergeConfigResolver;
     private final AshConfigResolver ashConfigResolver;
+    // whether fields get residual codes next to their ASH codes
+    private final boolean residualRerank;
 
     // Temporary storage for ASH projection matrix between buildAndWritePostingsLists and writePreconditioner
     private AshProjectionMatrix pendingAshMatrix;
+    // the residual quantizer fitted for the field whose posting lists were just written, written out by doWriteMeta
+    private PooledLloydMaxQuantizer pendingResidualQuantizer;
+    private long pendingResidualOffset;
+    private long pendingResidualLength;
 
     public ESNextDiskASHVectorsWriter(
         SegmentWriteState state,
@@ -104,6 +112,47 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         IvfMergeConfigResolver mergeConfigResolver,
         AshConfigResolver ashConfigResolver
     ) throws IOException {
+        this(
+            state,
+            rawVectorFormatName,
+            useDirectIOReads,
+            onDiskMerge,
+            rawVectorDelegate,
+            vectorPerCluster,
+            centroidsPerParentCluster,
+            mergeExec,
+            numMergeWorkers,
+            quantizerExec,
+            flatVectorThreshold,
+            sliceField,
+            flushConfigSource,
+            mergeConfigResolver,
+            ashConfigResolver,
+            true
+        );
+    }
+
+    /**
+     * @param residualRerank whether fields store residual codes next to their ASH codes
+     */
+    public ESNextDiskASHVectorsWriter(
+        SegmentWriteState state,
+        String rawVectorFormatName,
+        boolean useDirectIOReads,
+        boolean onDiskMerge,
+        FlatVectorsWriter rawVectorDelegate,
+        int vectorPerCluster,
+        int centroidsPerParentCluster,
+        TaskExecutor mergeExec,
+        int numMergeWorkers,
+        TaskExecutor quantizerExec,
+        int flatVectorThreshold,
+        String sliceField,
+        IvfFlushConfigSource flushConfigSource,
+        IvfMergeConfigResolver mergeConfigResolver,
+        AshConfigResolver ashConfigResolver,
+        boolean residualRerank
+    ) throws IOException {
         super(
             state,
             rawVectorFormatName,
@@ -117,7 +166,8 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             true,
             flatVectorThreshold,
             onDiskMerge,
-            true
+            true,
+            ESNextDiskASHVectorsFormat.RESIDUAL_EXTENSION
         );
         this.vectorPerCluster = vectorPerCluster;
         this.centroidsPerParentCluster = centroidsPerParentCluster;
@@ -128,6 +178,7 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         this.flushConfigSource = flushConfigSource != null ? flushConfigSource : IvfFlushConfigSource.empty();
         this.mergeConfigResolver = mergeConfigResolver != null ? mergeConfigResolver : IvfMergeConfigResolver.useCodecDefault();
         this.ashConfigResolver = ashConfigResolver;
+        this.residualRerank = residualRerank;
     }
 
     private IvfSegmentConfig.AshConfig ashConfig(FieldInfo fieldInfo) {
@@ -334,6 +385,8 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         // The reader uses vector ordinal order for doc translation via ordToDoc().
         boolean skipDocIds = sliceField != null && centroidSupplier.size() == 1;
         var ashWriter = new AshPostingsListWriter();
+        final IndexOutput residualOut = residualRerank ? residualOutput() : null;
+        pendingResidualOffset = residualOut == null ? 0 : residualOut.getFilePointer();
         var result = ashWriter.buildAndWrite(
             fieldInfo,
             centroidSupplier,
@@ -347,9 +400,12 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
             fieldInfo.getVectorSimilarityFunction(),
             skipDocIds,
             inherited,
-            useMergeTrainingFactor
+            useMergeTrainingFactor,
+            residualOut
         );
         pendingAshMatrix = ashWriter.getAshProjectionMatrix();
+        pendingResidualQuantizer = ashWriter.getResidualQuantizer();
+        pendingResidualLength = residualOut == null ? 0 : residualOut.getFilePointer() - pendingResidualOffset;
         return new CentroidOffsetAndLength(result.offsets(), result.lengths());
     }
 
@@ -383,6 +439,13 @@ public class ESNextDiskASHVectorsWriter extends IVFVectorsWriter<FlatCentroidInd
         // ASH-specific: bits per dimension — use the writer's own config rather than the segment
         // config, because the segment config may be IvfSegmentConfig.NONE for unsupported byte fields.
         metaOutput.writeVInt(ashConfig(field).bitsPerDim());
+        ResidualCodesMeta.write(
+            metaOutput,
+            pendingResidualQuantizer == null
+                ? null
+                : new ResidualCodesMeta(pendingResidualQuantizer, pendingResidualOffset, pendingResidualLength)
+        );
+        pendingResidualQuantizer = null;
     }
 
     @Override

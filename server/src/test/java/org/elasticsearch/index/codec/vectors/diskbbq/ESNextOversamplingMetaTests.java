@@ -83,7 +83,7 @@ public class ESNextOversamplingMetaTests extends ESBaseKnnVectorsFormatTestCase 
             }
             var offHeap = knnVectorsReader.getOffHeapByteSize(fieldInfo);
             long totalByteSize = offHeap.values().stream().mapToLong(Long::longValue).sum();
-            assertThat(offHeap, aMapWithSize(3));
+            assertThat(offHeap, aMapWithSize(4));
             assertThat(totalByteSize, greaterThanOrEqualTo(0L));
         } else {
             throw new AssertionError("unexpected:" + r.getClass());

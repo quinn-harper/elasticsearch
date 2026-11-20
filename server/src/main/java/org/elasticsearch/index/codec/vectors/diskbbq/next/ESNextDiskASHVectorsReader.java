@@ -9,6 +9,7 @@
 
 package org.elasticsearch.index.codec.vectors.diskbbq.next;
 
+import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.KnnVectorValues;
 import org.apache.lucene.index.SegmentReadState;
@@ -32,19 +33,25 @@ import org.elasticsearch.index.codec.vectors.diskbbq.CentroidIterator;
 import org.elasticsearch.index.codec.vectors.diskbbq.FlatCentroidIndex;
 import org.elasticsearch.index.codec.vectors.diskbbq.IVFVectorsReader;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfSegmentConfig;
+import org.elasticsearch.index.codec.vectors.diskbbq.PooledLloydMaxQuantizer;
 import org.elasticsearch.index.codec.vectors.diskbbq.PrefetchingCentroidIterator;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualCodesMeta;
+import org.elasticsearch.index.codec.vectors.diskbbq.ResidualRescoringReader;
 import org.elasticsearch.lucene.store.MemorySegmentAccessInputAccess;
 import org.elasticsearch.search.vectors.ESAcceptDocs;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * ASH-specific implementation of {@link IVFVectorsReader}. Scores posting lists using
  * {@link AshPostingsVisitor} with a precomputed projection matrix ({@link AshProjectionMatrix}).
  */
-public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVectorsReader.ASHFieldEntry> {
+public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVectorsReader.ASHFieldEntry>
+    implements
+        ResidualRescoringReader {
 
     private final ConcurrentHashMap<String, AshProjectionMatrix> ashMatrixCache;
 
@@ -71,7 +78,9 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             ESNextDiskASHVectorsFormat.VERSION_CURRENT,
             ESNextDiskASHVectorsFormat.VERSION_DIRECT_IO,
             ESNextDiskASHVectorsFormat.VERSION_ON_DISK_MERGE,
-            ESNextDiskASHVectorsFormat.DYNAMIC_VISIT_RATIO
+            ESNextDiskASHVectorsFormat.DYNAMIC_VISIT_RATIO,
+            ESNextDiskASHVectorsFormat.RESIDUAL_EXTENSION,
+            ESNextDiskASHVectorsFormat.VERSION_RESIDUAL_RERANK
         );
         this.ashMatrixCache = new ConcurrentHashMap<>();
         this.queryBitsPerDim = queryBitsPerDim;
@@ -183,6 +192,7 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             maxSliceSize = input.readVInt();
         }
         int ashBitsPerDim = input.readVInt();
+        ResidualCodesMeta residualCodes = ESNextDiskBBQVectorsReader.readResidualCodesMeta(input, versionMeta, globalCentroid.length);
         return new ASHFieldEntry(
             rawVectorFormat,
             useDirectIOReads,
@@ -201,8 +211,30 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             preconditionerLength,
             numSlices,
             maxSliceSize,
-            ashBitsPerDim
+            ashBitsPerDim,
+            residualCodes
         );
+    }
+
+    @Override
+    public boolean hasResidualCodes(String field) {
+        final FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
+        if (fieldInfo == null) {
+            return false;
+        }
+        final ASHFieldEntry entry = fields.get(fieldInfo.number);
+        return entry != null && entry.residualCodes() != null && entry.numCentroids() > 0;
+    }
+
+    @Override
+    public Map<String, Long> getOffHeapByteSize(FieldInfo fieldInfo) {
+        final Map<String, Long> sizes = super.getOffHeapByteSize(fieldInfo);
+        final ASHFieldEntry entry = fields.get(fieldInfo.number);
+        if (entry == null) {
+            return sizes;
+        }
+        final long residualLength = entry.residualCodes() == null ? 0L : entry.residualCodes().length();
+        return KnnVectorsReader.mergeOffHeapByteSizeMaps(sizes, Map.of(ESNextDiskASHVectorsFormat.RESIDUAL_EXTENSION, residualLength));
     }
 
     private AshProjectionMatrix getAshProjectionMatrix(FieldInfo fieldInfo) {
@@ -255,6 +287,29 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
         IndexInput centroidSlice,
         ESAcceptDocs acceptDocs
     ) throws IOException {
+        return getPostingVisitor(fieldInfo, values, indexInput, queryTarget, needsScoring, centroidSlice, acceptDocs, refineWithResiduals);
+    }
+
+    /**
+     * Whether searches refine competitive candidates with the stored residual codes. Always {@code true} in production;
+     * tests clear it to measure the coarse scores of the same segment through the regular search path.
+     */
+    // package-private for testing
+    boolean refineWithResiduals = true;
+
+    /**
+     * @param refineWithResiduals whether competitive candidates get their score refined with the stored residual codes
+     */
+    PostingVisitor getPostingVisitor(
+        FieldInfo fieldInfo,
+        KnnVectorValues values,
+        IndexInput indexInput,
+        QueryTarget queryTarget,
+        Bits needsScoring,
+        IndexInput centroidSlice,
+        ESAcceptDocs acceptDocs,
+        boolean refineWithResiduals
+    ) throws IOException {
         ASHFieldEntry entry = fields.get(fieldInfo.number);
         float[] target = switch (queryTarget) {
             case QueryTarget.FloatQuery fq -> fq.vector();
@@ -285,6 +340,7 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
         // to both the ES940OSQVectorsScorer and the visitor's own correction reads.
         IndexInput unwrappedInput = FilterIndexInput.unwrapOnlyTest(indexInput);
         unwrappedInput = MemorySegmentAccessInputAccess.unwrap(unwrappedInput);
+        final IndexInput residualInput = entry.residualCodes() == null ? null : entry.residualCodes().slice(ivfResiduals);
 
         if (entry.numSlices == 0) {
             // Sliced segment without per-slice centroid structure (e.g. flushed before merge).
@@ -312,6 +368,9 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
                 entry.ashBitsPerDim(),
                 queryBitsPerDim,
                 centroidReader,
+                entry.residualQuantizer(),
+                residualInput,
+                refineWithResiduals,
                 values,
                 startDoc,
                 endDoc
@@ -325,7 +384,10 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             needsScoring,
             entry.ashBitsPerDim(),
             queryBitsPerDim,
-            centroidReader
+            centroidReader,
+            entry.residualQuantizer(),
+            residualInput,
+            refineWithResiduals
         );
     }
 
@@ -416,7 +478,8 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             new QueryTarget.FloatQuery(query),
             null,
             entry.centroidSlice(ivfCentroids.clone()),
-            acceptDocs
+            acceptDocs,
+            refineWithResiduals
         );
     }
 
@@ -431,6 +494,7 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
         final int numSlices;
         final int maxSliceSize;
         private final int ashBitsPerDim;
+        private final ResidualCodesMeta residualCodes;
 
         ASHFieldEntry(
             String rawVectorFormat,
@@ -450,7 +514,8 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             long preconditionerLength,
             int numSlices,
             int maxSliceSize,
-            int ashBitsPerDim
+            int ashBitsPerDim,
+            ResidualCodesMeta residualCodes
         ) {
             super(
                 rawVectorFormat,
@@ -472,10 +537,21 @@ public class ESNextDiskASHVectorsReader extends IVFVectorsReader<ESNextDiskASHVe
             this.numSlices = numSlices;
             this.maxSliceSize = maxSliceSize;
             this.ashBitsPerDim = ashBitsPerDim;
+            this.residualCodes = residualCodes;
         }
 
         public CentroidIndexFormat centroidIndexFormat() {
             return centroidIndexFormat;
+        }
+
+        /** The residual codes this field stores for reranking, or {@code null} when it has none. */
+        public ResidualCodesMeta residualCodes() {
+            return residualCodes;
+        }
+
+        /** The quantizer decoding this field's residual codes, or {@code null} when it has none. */
+        public PooledLloydMaxQuantizer residualQuantizer() {
+            return residualCodes == null ? null : residualCodes.quantizer();
         }
 
         public long preconditionerOffset() {

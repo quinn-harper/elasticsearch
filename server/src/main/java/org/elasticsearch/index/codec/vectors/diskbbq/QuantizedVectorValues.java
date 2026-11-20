@@ -24,4 +24,12 @@ public interface QuantizedVectorValues {
     byte[] next() throws IOException;
 
     OptimizedScalarQuantizer.QuantizationResult getCorrections() throws IOException;
+
+    /**
+     * The residual codes of the vector returned by the last {@link #next()}, one byte per dimension, or {@code null}
+     * when this source has no residual codes. Writers append them to the residual file, never to the posting list.
+     */
+    default byte[] residualCodes() throws IOException {
+        return null;
+    }
 }
